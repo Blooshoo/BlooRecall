@@ -1,0 +1,81 @@
+{
+  "config_version": "bloorecall-bench-v1",
+  "index_format": "bloorecall-sqlite-v2",
+  "parse_version": "bloorecall-chunker-v2-headings",
+  "index_path": "var/bench/index.sqlite3",
+  "plain_index_path": "var/bench/index-plain.sqlite3",
+  "plain_parse_version": "bloorecall-chunker-v1-plain-bench",
+  "embedding": {
+    "model": "qwen3-embedding:0.6b",
+    "endpoint": "http://127.0.0.1:11434/api/embed",
+    "batch_size": 64,
+    "timeout_seconds": 300,
+    "keep_alive": "30m"
+  },
+  "corpus_roots": [
+    {"path": "bench/corpus/driftline", "label": "driftline", "max_files": 400},
+    {"path": "bench/corpus/homelab", "label": "homelab", "max_files": 400},
+    {"path": "bench/corpus/lumen-web", "label": "lumen-web", "max_files": 400},
+    {"path": "bench/corpus/orbital-lab", "label": "orbital-lab", "max_files": 400},
+    {"path": "bench/corpus/ferment", "label": "ferment", "max_files": 400},
+    {"path": "bench/corpus/taskherd", "label": "taskherd", "max_files": 400}
+  ],
+  "allowed_extensions": [".md", ".txt", ".rst"],
+  "max_file_bytes": 262144,
+  "chunk_chars": 1600,
+  "chunk_overlap_chars": 180,
+  "exclusions": {
+    "denied_path_parts": [
+      ".git", "node_modules", "site-packages", "vendor", "dist", "build",
+      "coverage", "target", ".venv", "venv", "__pycache__", "backup", "backups",
+      "secrets", "credentials", "memory", "memories", "sessions", "conversations"
+    ],
+    "denied_name_fragments": [".env", "credential", "secret", "password", "id_rsa"],
+    "denied_globs": []
+  },
+  "policies": {
+    "baseline-v0": {
+      "policy_id": "baseline-v0",
+      "dense_weight": 0.55,
+      "recency_weight": 0.05,
+      "metadata_weight": 0.15,
+      "rerank_budget": 20,
+      "top_k": 10
+    },
+    "bench-bm25": {
+      "policy_id": "bench-bm25",
+      "dense_weight": 0.0,
+      "recency_weight": 0.05,
+      "metadata_weight": 0.15,
+      "rerank_budget": 20,
+      "top_k": 10
+    },
+    "bench-dense": {
+      "policy_id": "bench-dense",
+      "dense_weight": 1.0,
+      "recency_weight": 0.05,
+      "metadata_weight": 0.15,
+      "rerank_budget": 20,
+      "top_k": 10
+    },
+    "bench-norerank": {
+      "policy_id": "bench-norerank",
+      "dense_weight": 0.55,
+      "recency_weight": 0.05,
+      "metadata_weight": 0.15,
+      "rerank_budget": 0,
+      "top_k": 10
+    },
+    "bench-norecency": {
+      "policy_id": "bench-norecency",
+      "dense_weight": 0.55,
+      "recency_weight": 0.0,
+      "metadata_weight": 0.15,
+      "rerank_budget": 20,
+      "top_k": 10
+    }
+  },
+  "active_policy": "baseline-v0",
+  "search_defaults": {"top_k": 10, "max_top_k": 50, "snippet_chars": 240},
+  "vector_cache_days": 14
+}

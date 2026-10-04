@@ -1,0 +1,81 @@
+{
+  "config_version": "bloorecall-v1",
+  "index_format": "bloorecall-sqlite-v2",
+  "parse_version": "bloorecall-chunker-v2-headings",
+  "index_path": "var/index.sqlite3",
+  "embedding": {
+    "model": "qwen3-embedding:0.6b",
+    "endpoint": "http://127.0.0.1:11434/api/embed",
+    "batch_size": 64,
+    "timeout_seconds": 300,
+    "keep_alive": "30m"
+  },
+  "corpus_roots": [
+    {
+      "path": "/home/you/notes",
+      "label": "notes",
+      "max_files": 4000
+    },
+    {
+      "path": "/home/you/projects",
+      "label": "projects",
+      "max_files": 4000
+    }
+  ],
+  "allowed_extensions": [
+    ".md",
+    ".txt",
+    ".rst"
+  ],
+  "max_file_bytes": 262144,
+  "chunk_chars": 1600,
+  "chunk_overlap_chars": 180,
+  "exclusions": {
+    "denied_path_parts": [
+      ".git",
+      "node_modules",
+      "site-packages",
+      "vendor",
+      "dist",
+      "build",
+      "coverage",
+      "target",
+      ".venv",
+      "venv",
+      "__pycache__",
+      "backup",
+      "backups",
+      "secrets",
+      "credentials",
+      "memory",
+      "memories",
+      "sessions",
+      "conversations"
+    ],
+    "denied_name_fragments": [
+      ".env",
+      "credential",
+      "secret",
+      "password",
+      "id_rsa"
+    ],
+    "denied_globs": []
+  },
+  "policies": {
+    "baseline-v0": {
+      "policy_id": "baseline-v0",
+      "dense_weight": 0.55,
+      "recency_weight": 0.05,
+      "metadata_weight": 0.15,
+      "rerank_budget": 20,
+      "top_k": 10
+    }
+  },
+  "active_policy": "baseline-v0",
+  "search_defaults": {
+    "top_k": 10,
+    "max_top_k": 50,
+    "snippet_chars": 240
+  },
+  "vector_cache_days": 14
+}

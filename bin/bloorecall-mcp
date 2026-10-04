@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# BlooRecall MCP stdio server. Register this path as an MCP stdio server in your
+# agent/client (see the README for Claude Code and mcpServers examples).
+# stdout is the MCP transport, so nothing here may print to stdout.
+set -euo pipefail
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+exec python3 -m bloorecall.mcp_server
