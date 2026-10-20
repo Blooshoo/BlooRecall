@@ -36,6 +36,7 @@
   "policies": {
     "baseline-v0": {
       "policy_id": "baseline-v0",
+      "fusion": "raw",
       "dense_weight": 0.55,
       "recency_weight": 0.05,
       "metadata_weight": 0.15,
@@ -44,6 +45,7 @@
     },
     "bench-bm25": {
       "policy_id": "bench-bm25",
+      "fusion": "raw",
       "dense_weight": 0.0,
       "recency_weight": 0.05,
       "metadata_weight": 0.15,
@@ -52,6 +54,7 @@
     },
     "bench-dense": {
       "policy_id": "bench-dense",
+      "fusion": "raw",
       "dense_weight": 1.0,
       "recency_weight": 0.05,
       "metadata_weight": 0.15,
@@ -60,6 +63,7 @@
     },
     "bench-norerank": {
       "policy_id": "bench-norerank",
+      "fusion": "raw",
       "dense_weight": 0.55,
       "recency_weight": 0.05,
       "metadata_weight": 0.15,
@@ -68,8 +72,19 @@
     },
     "bench-norecency": {
       "policy_id": "bench-norecency",
+      "fusion": "raw",
       "dense_weight": 0.55,
       "recency_weight": 0.0,
+      "metadata_weight": 0.15,
+      "rerank_budget": 20,
+      "top_k": 10
+    },
+    "hybrid-rrf-v1": {
+      "policy_id": "hybrid-rrf-v1",
+      "fusion": "rrf",
+      "dense_weight": 0.5,
+      "rrf_k": 60,
+      "recency_weight": 0.05,
       "metadata_weight": 0.15,
       "rerank_budget": 20,
       "top_k": 10

@@ -40,7 +40,7 @@ Requires Python 3.12+, `numpy`, the `mcp` SDK, and a running local Ollama with a
 git clone <this repo> && cd bloorecall
 pip install numpy mcp
 ollama pull qwen3-embedding:0.6b          # any Ollama embedding model works; set it in config
-python3 -m unittest discover -s tests     # 65 tests, no network needed
+python3 -m unittest discover -s tests     # 76 tests, no network needed
 ```
 
 Put `bin/` on your `PATH` for a short command, or run `./bin/bloorecall` in place.
@@ -87,17 +87,23 @@ claude mcp add bloorecall -- /abs/path/to/bloorecall/bin/bloorecall-mcp
    (heading-aware for Markdown), embed changed chunks via Ollama, store vectors + a BM25 index in
    SQLite. Incremental: an unchanged file is skipped by size/mtime, an edited paragraph re-embeds
    one chunk. A no-change refresh is ~instant.
-2. **Search**: embed the query, score every chunk as
-   `dense·0.55 + bm25·0.45 + recency·0.05 + metadata·0.15` (a named, editable policy), keep the
-   best chunk per file, re-rank the top results with a term-coverage bonus, then verify each hit
-   against disk.
+2. **Search**: embed the query, rank every chunk by meaning (dense) and by keyword (BM25), and
+   fuse the two orders with reciprocal-rank fusion, plus small recency and path-match bonuses (a
+   named, editable policy). Fusing ranks rather than raw scores keeps either signal from drowning
+   out the other. Keep the best chunk per file, re-rank the top results with a term-coverage
+   bonus, then verify each hit against disk.
 
 ## Benchmark
 
 Against a one-pass grep baseline (what an agent gets from a single `rg` search) on a 251-file
-synthetic corpus, BlooRecall as shipped reaches **Recall@5 0.87 vs grep's 0.73** (MRR@10 0.77 vs
-0.58). In the same run, **embeddings alone did even better** (0.95 / 0.86), and grep was higher on
-queries whose answer sits under a heading (0.80 vs 0.70). Tuning the blend is the next step.
+synthetic corpus, BlooRecall as shipped reaches **Recall@5 0.97 vs grep's 0.73** (MRR@10 0.89 vs
+0.58), and matches or beats grep in every query category.
+
+v1.0 shipped a linear blend that, it turned out, let BM25 overrule the embeddings (0.87 / 0.77,
+behind embeddings alone at 0.95 / 0.86). v1.1 fuses ranks instead: it sits level with
+embeddings-only on meaning-style queries and keeps keyword search's edge on exact identifiers.
+The fusion was picked on the dev split (`python3 -m bench.sweep`) and confirmed once on test;
+the report has the diagnosis.
 
 ![Recall@5 by system](docs/benchmark.svg)
 
@@ -109,8 +115,13 @@ red-team review and one-command reproduction are in [`bench/REPORT.md`](bench/RE
 
 `config.json` (write a starter with `bloorecall init`). Key fields: `corpus_roots` (read-only
 folders with a `label` and `max_files`), `allowed_extensions`, `embedding` (Ollama model +
-endpoint), `policies` / `active_policy` (retrieval weights), `exclusions`, `search_defaults`. All
-paths are absolute; the index lives under the project's `var/`.
+endpoint), `policies` / `active_policy` (retrieval weights and `fusion`: `rrf`, or `raw` for the
+v1.0 blend), `exclusions`, `search_defaults`. All paths are absolute; the index lives under the
+project's `var/`.
+
+**Upgrading from v1.0:** a policy without a `fusion` key keeps the v1.0 blend, so a policy id
+always means one behavior. To get v1.1's ranking, copy the `hybrid-rrf-v1` block from
+`config.example.json` into your `policies` and set `"active_policy": "hybrid-rrf-v1"`.
 
 ## Keeping it fresh
 
@@ -120,7 +131,7 @@ audit (exit 1 on drift).
 
 ## Status
 
-v1. 65 tests, all local. Born as a throwaway tool for personal knowledge-base research that turned
+v1.1. 76 tests, all local. Born as a throwaway tool for personal knowledge-base research that turned
 out to be genuinely useful, so it's shared in case it helps you too.
 
 ## License

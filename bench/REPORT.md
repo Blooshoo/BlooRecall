@@ -3,7 +3,7 @@
 Honest answer to "is BlooRecall actually better than what a coding agent does by
 default, and where?" — with the places it loses included.
 
-**One-sentence result:** Dense-only beats the shipped hybrid on MRR@10 (paired -0.086, 95% CI [-0.166, -0.013]); at Recall@5 the point estimate also favors dense (0.952 vs 0.873) but the paired CI grazes zero. Hybrid clearly beats the frozen one-pass grep baseline on this corpus (paired +0.14 Recall@5, +0.19 MRR@10), while grep is higher on heading-context in this sample — the per-category table and paired deltas say where.
+**One-sentence result:** Shipped BlooRecall (v1.1, rank fusion) reaches Recall@5 0.968 / MRR@10 0.890, up from v1.0's linear blend (0.873 / 0.771; paired MRR@10 +0.119, 95% CI [+0.056, +0.191]). It is level with dense-only on MRR@10 (paired +0.033, CI [-0.012, +0.085]) and beats the frozen one-pass grep baseline (Recall@5 0.730; paired MRR@10 +0.307, CI [+0.216, +0.403]).
 
 ## Setup
 
@@ -27,11 +27,15 @@ default, and where?" — with the places it loses included.
 - **Split discipline:** dev/test ≈ 30/70 assigned deterministically from
   `sha256(query id)`. All design decisions were made on dev or on the corpus
   itself before any test run; the test split ran once per system, frozen, at
-  commit `84a7c22c5058`.
+  commit `84a7c22c5058`. **v1.1 (`hybrid-rrf`)** was chosen afterwards on dev
+  alone (the sweep below; `python3 -m bench.sweep` reruns it) and run once on
+  test at commit `fa918d399396`; the v1.0 rows were not re-run.
 - **Model/hardware:** qwen3-embedding:0.6b (Ollama, 1024-dim); Intel(R) Core(TM) i7-14700K, Linux-7.0.0-30-generic-x86_64-with-glibc2.39.
   Index build: main (heading-aware) 30.266s, plain-chunker ablation 22.064s
   for 251 files. Query latency is single-process, warm
-  Ollama (`keep_alive`), one warmup query excluded.
+  Ollama (`keep_alive`), one warmup query excluded. The `hybrid-rrf` row was
+  timed in a later session (Linux-7.0.0-38-generic-x86_64-with-glibc2.39), so compare latency within a
+  session, not across rows from different ones; RRF itself adds ~2 ms of ranking per query.
 - **Metric definitions:** recall@k = a relevant doc (grade ≥ 1) in the top k;
   MRR@10 = 1/rank of the first relevant doc; nDCG@10 uses graded gains
   2^rel−1. CIs are percentile bootstrap over queries (1000 resamples,
@@ -39,9 +43,8 @@ default, and where?" — with the places it loses included.
   embeds. Grep latency is our Python implementation, not the `rg` binary.
 - **Reproduce:**
   ```bash
-  git checkout bench-study
   python3 -m bench.manifest apply                      # set file times from MANIFEST.json
-  python3 -m unittest discover -s tests                # 65 tests, no network needed
+  python3 -m unittest discover -s tests                # 76 tests, no network needed
   python3 -m bench.run --system all --split dev --fresh
   python3 -m bench.run --system all --split test --fresh
   python3 -m bench.report                              # regenerate this file from results/
@@ -62,6 +65,7 @@ default, and where?" — with the places it loses included.
 | bm25 | 0.603 | 0.825 | 0.921 | 0.692 | 0.651 | [0.730, 0.905] | 1 | 1 |
 | dense | 0.794 | 0.952 | 0.952 | 0.858 | 0.790 | [0.889, 1.000] | 126 | 148 |
 | hybrid | 0.698 | 0.873 | 0.968 | 0.771 | 0.729 | [0.794, 0.952] | 126 | 139 |
+| hybrid-rrf | 0.841 | 0.968 | 0.968 | 0.890 | 0.824 | [0.921, 1.000] | 37 | 104 |
 | hybrid-noheadings | 0.603 | 0.905 | 0.936 | 0.714 | 0.687 | [0.825, 0.968] | 124 | 139 |
 | hybrid-norerank | 0.714 | 0.889 | 0.952 | 0.784 | 0.740 | [0.809, 0.952] | 125 | 142 |
 | hybrid-norecency | 0.698 | 0.905 | 0.952 | 0.770 | 0.729 | [0.825, 0.968] | 128 | 141 |
@@ -71,14 +75,26 @@ Read with the paired deltas — overlapping CIs are easy to misread:
 
 ### Paired deltas (same queries, per-query differences)
 
+- **hybrid-rrf − hybrid, recall@5: +0.095** (95% CI [+0.032, +0.175]; hybrid-rrf better on 6 queries, hybrid better on 0, 57 ties)
+- **hybrid-rrf − dense, recall@5: +0.016** (95% CI [+0.000, +0.048]; hybrid-rrf better on 1 queries, dense better on 0, 62 ties)
+- **hybrid-rrf − grep, recall@5: +0.238** (95% CI [+0.143, +0.349]; hybrid-rrf better on 15 queries, grep better on 0, 48 ties)
+- **hybrid-rrf − bm25, recall@5: +0.143** (95% CI [+0.064, +0.238]; hybrid-rrf better on 9 queries, bm25 better on 0, 54 ties)
 - **hybrid − grep, recall@5: +0.143** (95% CI [+0.032, +0.254]; hybrid better on 12 queries, grep better on 3, 48 ties)
 - **hybrid − bm25, recall@5: +0.048** (95% CI [-0.016, +0.127]; hybrid better on 4 queries, bm25 better on 1, 58 ties)
 - **hybrid − dense, recall@5: -0.079** (95% CI [-0.159, +0.000]; hybrid better on 1 queries, dense better on 6, 56 ties)
 - **hybrid − hybrid-noheadings, recall@5: -0.032** (95% CI [-0.095, +0.032]; hybrid better on 1 queries, hybrid-noheadings better on 3, 59 ties)
+- **hybrid-rrf − hybrid, mrr@10: +0.119** (95% CI [+0.056, +0.191]; hybrid-rrf better on 15 queries, hybrid better on 1, 47 ties)
+- **hybrid-rrf − dense, mrr@10: +0.033** (95% CI [-0.012, +0.085]; hybrid-rrf better on 7 queries, dense better on 5, 51 ties)
+- **hybrid-rrf − grep, mrr@10: +0.307** (95% CI [+0.216, +0.403]; hybrid-rrf better on 30 queries, grep better on 1, 32 ties)
+- **hybrid-rrf − bm25, mrr@10: +0.198** (95% CI [+0.123, +0.284]; hybrid-rrf better on 22 queries, bm25 better on 1, 40 ties)
 - **hybrid − grep, mrr@10: +0.189** (95% CI [+0.104, +0.277]; hybrid better on 27 queries, grep better on 6, 30 ties)
 - **hybrid − bm25, mrr@10: +0.079** (95% CI [+0.035, +0.133]; hybrid better on 17 queries, bm25 better on 1, 45 ties)
 - **hybrid − dense, mrr@10: -0.086** (95% CI [-0.166, -0.013]; hybrid better on 3 queries, dense better on 17, 43 ties)
 - **hybrid − hybrid-noheadings, mrr@10: +0.057** (95% CI [+0.003, +0.121]; hybrid better on 14 queries, hybrid-noheadings better on 8, 41 ties)
+- **hybrid-rrf − hybrid, ndcg@10: +0.095** (95% CI [+0.055, +0.140]; hybrid-rrf better on 24 queries, hybrid better on 5, 34 ties)
+- **hybrid-rrf − dense, ndcg@10: +0.033** (95% CI [-0.005, +0.074]; hybrid-rrf better on 17 queries, dense better on 13, 33 ties)
+- **hybrid-rrf − grep, ndcg@10: +0.283** (95% CI [+0.200, +0.358]; hybrid-rrf better on 40 queries, grep better on 4, 19 ties)
+- **hybrid-rrf − bm25, ndcg@10: +0.172** (95% CI [+0.120, +0.234]; hybrid-rrf better on 30 queries, bm25 better on 3, 30 ties)
 - **hybrid − grep, ndcg@10: +0.188** (95% CI [+0.119, +0.260]; hybrid better on 35 queries, grep better on 10, 18 ties)
 - **hybrid − bm25, ndcg@10: +0.077** (95% CI [+0.045, +0.114]; hybrid better on 27 queries, bm25 better on 0, 36 ties)
 - **hybrid − dense, ndcg@10: -0.062** (95% CI [-0.118, -0.003]; hybrid better on 12 queries, dense better on 24, 27 ties)
@@ -88,48 +104,77 @@ Read with the paired deltas — overlapping CIs are easy to misread:
 
 Recall@5 per category (test split):
 
-| category | grep | filename | bm25 | dense | hybrid | hybrid-noheadings | hybrid-norerank | hybrid-norecency |
-|---|---|---|---|---|---|---|---|---|
-| deep-in-long-doc (one fact buried 2000+ words into a 3000+ word doc) | 1.000 | 0.750 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
-| disambiguation (similarly named things across projects or versions, query carries the discriminator) | 0.889 | 0.889 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
-| exact-identifier (query names an error code / config key / function that is unique to one doc) | 0.889 | 0.222 | 1.000 | 0.889 | 1.000 | 1.000 | 1.000 | 1.000 |
-| heading-context (answer paragraph's topic words live only in its section headings) | 0.800 | 0.600 | 0.800 | 0.900 | 0.700 | 0.800 | 0.700 | 0.700 |
-| paraphrase (query avoids the doc's wording (vocabulary gaps)) | 0.125 | 0.500 | 0.500 | 0.875 | 0.750 | 0.750 | 0.875 | 0.750 |
-| recency (asked for the CURRENT decision; an older doc was superseded (backdated mtime)) | 0.778 | 0.889 | 0.889 | 1.000 | 0.889 | 0.889 | 1.000 | 1.000 |
-| vague-recall (asked from memory, by nickname or episode) | 0.600 | 0.700 | 0.600 | 1.000 | 0.800 | 0.900 | 0.700 | 0.900 |
+| category | grep | filename | bm25 | dense | hybrid | hybrid-rrf | hybrid-noheadings | hybrid-norerank | hybrid-norecency |
+|---|---|---|---|---|---|---|---|---|---|
+| deep-in-long-doc (one fact buried 2000+ words into a 3000+ word doc) | 1.000 | 0.750 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| disambiguation (similarly named things across projects or versions, query carries the discriminator) | 0.889 | 0.889 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| exact-identifier (query names an error code / config key / function that is unique to one doc) | 0.889 | 0.222 | 1.000 | 0.889 | 1.000 | 1.000 | 1.000 | 1.000 | 1.000 |
+| heading-context (answer paragraph's topic words live only in its section headings) | 0.800 | 0.600 | 0.800 | 0.900 | 0.700 | 0.900 | 0.800 | 0.700 | 0.700 |
+| paraphrase (query avoids the doc's wording (vocabulary gaps)) | 0.125 | 0.500 | 0.500 | 0.875 | 0.750 | 0.875 | 0.750 | 0.875 | 0.750 |
+| recency (asked for the CURRENT decision; an older doc was superseded (backdated mtime)) | 0.778 | 0.889 | 0.889 | 1.000 | 0.889 | 1.000 | 0.889 | 1.000 | 1.000 |
+| vague-recall (asked from memory, by nickname or episode) | 0.600 | 0.700 | 0.600 | 1.000 | 0.800 | 1.000 | 0.900 | 0.700 | 0.900 |
 
-## Where hybrid does NOT win
+## v1.1: why the blend lost, and the fix
 
-See the per-category table above: the categories where `grep` matches or
-beats `hybrid` get named here with example queries (filled from the actual
-run below), and the paired-delta lines above quantify how often each system
-wins per query.
+v1.0 blended raw scores: `0.55·(cos+1)/2 + 0.45·bm25/max`. Over a query's top
+20 dense candidates, `(cos+1)/2` moves by a few hundredths while `bm25/max`
+spans nearly the whole [0, 1] range (medians in the sweep header below), so
+BM25 decided the order and the 0.55 dense weight was nominal. That is the
+whole of "dense-only beats hybrid" in the v1.0 rows.
 
-Categories where **grep ≥ hybrid** on Recall@5 (point estimates; small n per cell):
-- `deep-in-long-doc`: grep 1.000 vs hybrid 1.000. Example queries:
+v1.1 fuses **ranks** instead (reciprocal-rank fusion, `"fusion": "rrf"`),
+which is scale-free, so the weight means what it says for any embedder or
+corpus size. The shipped setting is the conventional 50/50 with k=60, not the
+best dev cell: RRF sits within ~0.01 MRR@10 across weights 0.5-0.7 on 33 dev
+queries, which is noise, and the textbook default carries no tuning risk.
+Per-query min-max rescaling (`"minmax"`) does about as well on dev, but only
+at dense weights of 0.85 and up, where it is close to dense-only; it also
+anchors to the query's least similar chunk, so its effective weight drifts as
+the corpus grows. Dev did not separate the two; scale-robustness picked RRF.
+Keyword-only mode (Ollama down) is unchanged.
+
+dev split, 33 queries, other fields from baseline-v0
+median score spread over each query's top 20 dense candidates: dense (cos+1)/2 0.069, bm25/max 0.994
+
+| fusion | dense_weight | recall@1 | recall@5 | mrr@10 | ndcg@10 |
+|---|---|---|---|---|---|
+| raw | 0.40 | 0.576 | 0.697 | 0.645 | 0.620 |
+| raw | 0.50 | 0.576 | 0.727 | 0.649 | 0.624 |
+| raw | 0.55 | 0.576 | 0.727 | 0.655 | 0.635 |
+| raw | 0.70 | 0.606 | 0.818 | 0.696 | 0.664 |
+| raw | 0.85 | 0.667 | 0.818 | 0.738 | 0.711 |
+| raw | 1.00 | 0.727 | 0.818 | 0.770 | 0.751 |
+| minmax | 0.40 | 0.636 | 0.849 | 0.714 | 0.669 |
+| minmax | 0.50 | 0.667 | 0.849 | 0.736 | 0.691 |
+| minmax | 0.55 | 0.697 | 0.849 | 0.757 | 0.713 |
+| minmax | 0.70 | 0.727 | 0.879 | 0.783 | 0.749 |
+| minmax | 0.85 | 0.788 | 0.909 | 0.820 | 0.784 |
+| minmax | 1.00 | 0.788 | 0.909 | 0.819 | 0.783 |
+| rrf | 0.40 | 0.758 | 0.849 | 0.790 | 0.713 |
+| rrf | 0.50 | 0.788 | 0.879 | 0.810 | 0.756 |
+| rrf | 0.55 | 0.788 | 0.879 | 0.817 | 0.774 |
+| rrf | 0.70 | 0.788 | 0.849 | 0.822 | 0.783 | ←
+| rrf | 0.85 | 0.727 | 0.909 | 0.784 | 0.769 |
+| rrf | 1.00 | 0.667 | 0.849 | 0.758 | 0.750 |
+
+← best MRR@10 (ties broken by Recall@5).
+
+## Where shipped BlooRecall does NOT win
+
+See the per-category table above: the categories where `grep` or dense-only
+matches or beats the shipped `hybrid-rrf` get named here with example queries
+(filled from the actual run below), and the paired-delta lines above quantify
+how often each system wins per query.
+
+Categories where **grep ≥ hybrid-rrf** on Recall@5 (point estimates; small n per cell):
+- `deep-in-long-doc`: grep 1.000 vs hybrid-rrf 1.000. Example queries:
     - (q-043) "what's the measured per-stage frame budget on the heaviest scene and how much headroom remains"
     - (q-045) "exact numbers for a three-litre kombucha batch: water, sugar, tea bags, starter, days"
     - (q-047) "which network segment has no route to the internet and why"
-- `heading-context`: grep 0.800 vs hybrid 0.700. Example queries:
-    - (q-030) "what's the resident RAM budget for the demo route and what gets cut first"
-    - (q-031) "how long until you get control back after dying at a kiln checkpoint"
-    - (q-032) "dark liquid pooled on top of my starter — is the jar done for"
 
-Categories where **dense-only > shipped hybrid** on Recall@5 (the blend gives back embeddings' gains):
-- `heading-context`: dense 0.900 vs hybrid 0.700. Example queries:
-    - (q-030) "what's the resident RAM budget for the demo route and what gets cut first"
-    - (q-031) "how long until you get control back after dying at a kiln checkpoint"
-- `paraphrase`: dense 0.875 vs hybrid 0.750. Example queries:
-    - (q-001) "why does the game seize up for a few seconds right when you launch it"
-    - (q-003) "kraut brine went opaque white by day three, is that fine"
-- `recency`: dense 1.000 vs hybrid 0.889. Example queries:
-    - (q-070) "how long is coyote time these days"
-    - (q-071) "what's the ginger bug feeding routine we settled on"
-- `vague-recall`: dense 1.000 vs hybrid 0.800. Example queries:
-    - (q-083) "whatever came of that fox sprite cache thing"
-    - (q-084) "what was that sled workaround for the steep downhill sections?"
+No category where dense-only > hybrid-rrf on Recall@5 in this run.
 
-Hybrid's clearest win: `paraphrase` (hybrid 0.750 vs grep 0.125).
+Clearest win over grep: `paraphrase` (hybrid-rrf 0.875 vs grep 0.125).
 
 ## Ablations (what each piece buys)
 
@@ -141,6 +186,9 @@ Hybrid's clearest win: `paraphrase` (hybrid 0.750 vs grep 0.125).
   (it should be small; the corpus times are engineered, so this ablation is
   the honesty check on the `recency` category).
 - **dense vs bm25 vs hybrid**: the blend against its own ingredients.
+
+These ablations were run on the v1.0 linear blend and have not been re-run
+under RRF, so read them as statements about v1.0's components.
 
 Ablation wording discipline: with ~9-10 queries per category and Recall@5
 moving in steps of ~0.1, the ablations support "higher observed Recall@5"
@@ -158,6 +206,7 @@ observed Recall@5).
 | bm25 | 0.515 | 0.667 | 0.599 | 0.577 |
 | dense | 0.727 | 0.818 | 0.770 | 0.751 |
 | hybrid | 0.576 | 0.727 | 0.655 | 0.635 |
+| hybrid-rrf | 0.788 | 0.879 | 0.810 | 0.756 |
 | hybrid-noheadings | 0.576 | 0.758 | 0.645 | 0.620 |
 | hybrid-norerank | 0.576 | 0.788 | 0.667 | 0.650 |
 | hybrid-norecency | 0.606 | 0.758 | 0.676 | 0.648 |
@@ -171,6 +220,11 @@ observed Recall@5).
    (`AUDIT-NOTES.md`) quantifies but cannot eliminate template leakage.
 2. **One embedding model, one language, one machine.** qwen3-embedding:0.6b
    at 1024 dims; a stronger embedder could shift dense/hybrid numbers.
+   Corpus and queries are English only. An informal probe on a real mixed
+   English/Chinese notes folder (English queries, Chinese docs) suggested
+   that 50/50 fusion still gives BM25 half the vote when all it can match is
+   noise, so notes in several languages may want a higher dense_weight.
+   Not measured here.
 3. **Small test set.** 63 test queries; per-category cells are ~8-10
    queries, so per-category CIs are wide (shown in the results JSON). The
    paired deltas are the sharper instrument.
@@ -190,24 +244,13 @@ observed Recall@5).
    actually contributes (small), and grep ignores mtimes entirely.
 6. **Chunk-level index, file-level evaluation** on both sides: BlooRecall
    ranks its best chunk per file (shipped behavior); grep ranks files.
-7. **No tuning at all** — shipped weights are used as-is. That is the honest
-   "as shipped" question, but it means no one optimized BlooRecall for this
-   corpus, and the dev split was used only for sanity checks, not weight
-   search.
-
-## Proposed README section (NOT applied — for the owner to review)
-
-```markdown
-## Benchmark
-
-Against a frozen one-pass grep baseline (what an agent gets from one `rg`
-pass) on a 251-file synthetic corpus, shipped BlooRecall reaches Recall@5
-0.87 vs grep's 0.73 (MRR@10 0.77 vs 0.58); dense-only retrieval scores
-0.95/0.86, and grep is higher on heading-only queries (0.80 vs 0.70).
-Synthetic corpus and queries, single 0.6b embedding model, 63 test
-queries — treat the deltas, not the absolutes.
-![Recall@5 by system](docs/benchmark.svg)
-```
+7. **v1.0 had no tuning at all; v1.1's fusion was picked on dev.** The v1.1
+   choice came from about thirty settings on 33 dev queries (the 18 above,
+   plus RRF k and normalization variants tried first),
+   which is a forking-paths risk; the defence is that the pick is the
+   conventional RRF default rather than the dev-best cell, and that the
+   test split confirmed it once. A different corpus or embedder could still
+   prefer a different dense weight.
 
 ## Reproduction artifacts
 

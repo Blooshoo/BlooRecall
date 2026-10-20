@@ -2,5 +2,8 @@
 # BlooRecall v1 launcher: runs the CLI from anywhere without installing the package.
 set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# -P: never import from the caller's working directory. `python3 -m` otherwise puts it ahead
+# of PYTHONPATH, so any folder holding a bloorecall/ package (another checkout, or a planted
+# one) would run instead of this install.
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-exec python3 -m bloorecall.cli "$@"
+exec python3 -P -m bloorecall.cli "$@"

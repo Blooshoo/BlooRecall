@@ -23,6 +23,14 @@ REQUIRED_KEYS = (
     "search_defaults",
 )
 POLICY_KEYS = ("dense_weight", "recency_weight", "metadata_weight", "rerank_budget", "top_k")
+# How dense and BM25 evidence are combined (optional policy key "fusion").
+# "rrf" fuses the two rank orders (reciprocal-rank fusion); it is scale-free, so dense_weight
+# means what it says, and hybrid-rrf-v1 ships it. "raw" is the v0 score blend with cosine mapped
+# to (cos+1)/2: that squeezes every chunk into a narrow band while BM25 is max-normalized to
+# span [0, 1], so BM25 dominates whatever dense_weight says. "minmax" rescales the query's
+# similarities to span [0, 1] before blending. A policy without the key gets "raw", so a
+# policy id always names one behavior and baseline-v0's benchmark results stay reproducible.
+FUSION_MODES = ("raw", "minmax", "rrf")
 
 
 def config_path(explicit: str | Path | None = None) -> Path:
@@ -83,16 +91,18 @@ def default_config(roots: list[dict[str, Any]]) -> dict[str, Any]:
             "denied_globs": [],
         },
         "policies": {
-            "baseline-v0": {
-                "policy_id": "baseline-v0",
-                "dense_weight": 0.55,
+            "hybrid-rrf-v1": {
+                "policy_id": "hybrid-rrf-v1",
+                "fusion": "rrf",
+                "dense_weight": 0.5,
+                "rrf_k": 60,
                 "recency_weight": 0.05,
                 "metadata_weight": 0.15,
                 "rerank_budget": 20,
                 "top_k": 10,
             }
         },
-        "active_policy": "baseline-v0",
+        "active_policy": "hybrid-rrf-v1",
         "search_defaults": {"top_k": 10, "max_top_k": 50, "snippet_chars": 240},
         "vector_cache_days": 14,
     }
@@ -109,6 +119,11 @@ def _validate_policies(data: dict[str, Any], path: Path) -> None:
         missing = [key for key in POLICY_KEYS if key not in policy]
         if missing:
             raise RuntimeError(f"policy '{name}' in {path} is missing: {', '.join(missing)}")
+        fusion = policy.get("fusion", "raw")
+        if fusion not in FUSION_MODES:
+            raise RuntimeError(
+                f"policy '{name}' in {path} has fusion '{fusion}'; expected one of {', '.join(FUSION_MODES)}"
+            )
 
 
 def active_policy(config: dict[str, Any], override: str | None = None) -> dict[str, Any]:

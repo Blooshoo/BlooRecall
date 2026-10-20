@@ -19,17 +19,22 @@ from bloorecall.util import PROJECT_ROOT
 RESULTS = PROJECT_ROOT / "bench" / "results"
 REPORT = PROJECT_ROOT / "bench" / "REPORT.md"
 QUERIES = PROJECT_ROOT / "bench" / "queries.jsonl"
+SWEEP = RESULTS / "sweep" / "dev.json"
 
-SYSTEM_ORDER = ["grep", "filename", "bm25", "dense", "hybrid", "hybrid-noheadings", "hybrid-norerank", "hybrid-norecency"]
+SYSTEM_ORDER = ["grep", "filename", "bm25", "dense", "hybrid", "hybrid-rrf", "hybrid-noheadings", "hybrid-norerank", "hybrid-norecency"]
+# The system the "where it does NOT win" section holds to account: whatever ships today.
+SHIPPED = "hybrid-rrf"
 SYSTEM_DESC = {
     "grep": "grep — case-insensitive substring of the query's non-stopword terms; rank by distinct terms matched, then matching lines. Our Python stand-in for the rg pass an agent would run (not rg's C speed).",
     "filename": "filename — same terms matched against the file path only.",
     "bm25": "BlooRecall keyword-only: dense_weight 0, query NOT embedded (the shipped fallback path when Ollama is down). Keeps recency 0.05 / metadata 0.15 / coverage re-rank 20.",
     "dense": "BlooRecall embeddings-only: dense_weight 1.0 (BM25 computed but weighted out). Query embedded; same recency/metadata/re-rank as shipped.",
-    "hybrid": "BlooRecall exactly as shipped: baseline-v0 policy (0.55 dense + 0.45 bm25 + 0.05 recency + 0.15 metadata, coverage re-rank over top 20), heading-aware chunks. Ranking path is the shipped rank(); per-hit trust verification and snippets don't affect ranking and are skipped.",
+    "hybrid": "BlooRecall v1.0 as shipped: baseline-v0 policy, a linear blend of raw scores (0.55 dense + 0.45 bm25 + 0.05 recency + 0.15 metadata, coverage re-rank over top 20), heading-aware chunks. Ranking path is the shipped rank(); per-hit trust verification and snippets don't affect ranking and are skipped.",
+    "hybrid-rrf": "BlooRecall v1.1 as shipped: hybrid-rrf-v1 policy, reciprocal-rank fusion of the dense and BM25 orders (50/50, k=60), then the same recency / metadata / coverage re-rank as baseline-v0.",
     "hybrid-noheadings": "hybrid over an index built with the plain paragraph chunker (opt-in chunker_override='plain'), no heading breadcrumbs. Same embeddings, same policy.",
     "hybrid-norerank": "hybrid with rerank_budget 0 (no term-coverage re-rank).",
     "hybrid-norecency": "hybrid with recency_weight 0. Quantifies how much the engineered file times contribute through the recency feature (metadata weight unchanged).",
+    "hybrid-v1": "hybrid with fusion 'minmax': dense similarities rescaled per query to span [0, 1] like BM25, instead of v0's (cos+1)/2. Same weights as shipped; isolates the fusion change.",
 }
 CATEGORY_DESC = {
     "paraphrase": "query avoids the doc's wording (vocabulary gaps)",
@@ -113,12 +118,13 @@ def category_table(test: Dict[str, Dict[str, Any]], metric: str = "recall@5") ->
     categories = sorted(
         {cat for system in test.values() for cat in system["metrics"]["by_category"]}
     )
-    header = "| category | " + " | ".join(SYSTEM_ORDER) + " |"
-    sep = "|---|" + "---|" * len(SYSTEM_ORDER)
+    systems = [system for system in SYSTEM_ORDER if system in test]
+    header = "| category | " + " | ".join(systems) + " |"
+    sep = "|---|" + "---|" * len(systems)
     lines = [f"Recall@5 per category (test split):", "", header, sep]
     for category in categories:
         cells = []
-        for system in SYSTEM_ORDER:
+        for system in systems:
             value = test.get(system, {}).get("metrics", {}).get("by_category", {}).get(category, {}).get(metric)
             cells.append("—" if value is None else fmt_cell(value))
         lines.append(f"| {category} ({CATEGORY_DESC.get(category, '')}) | " + " | ".join(cells) + " |")
@@ -127,7 +133,10 @@ def category_table(test: Dict[str, Dict[str, Any]], metric: str = "recall@5") ->
 
 def paired_section(test: Dict[str, Dict[str, Any]]) -> str:
     lines = ["", "### Paired deltas (same queries, per-query differences)", ""]
-    pairs = [("hybrid", "grep"), ("hybrid", "bm25"), ("hybrid", "dense"), ("hybrid", "hybrid-noheadings")]
+    pairs = [
+        ("hybrid-rrf", "hybrid"), ("hybrid-rrf", "dense"), ("hybrid-rrf", "grep"), ("hybrid-rrf", "bm25"),
+        ("hybrid", "grep"), ("hybrid", "bm25"), ("hybrid", "dense"), ("hybrid", "hybrid-noheadings"),
+    ]
     for metric in ("recall@5", "mrr@10", "ndcg@10"):
         for a, b in pairs:
             if a not in test or b not in test:
@@ -165,32 +174,39 @@ def example_queries(category: str, count: int = 3, split: str | None = "test") -
     ][:count]
 
 
+def sweep_section() -> str:
+    """The committed dev sweep (bench.sweep), or a pointer to it when it hasn't been run."""
+    if not SWEEP.exists():
+        return "_No sweep results yet: run `python3 -m bench.sweep` to write them._"
+    from bench.sweep import format_table
+
+    return format_table(json.loads(SWEEP.read_text(encoding="utf-8")), advice=False)
+
+
 def one_sentence_result(test: Dict[str, Dict[str, Any]]) -> str:
-    hybrid = test.get("hybrid", {}).get("metrics", {}).get("overall", {})
+    shipped = test.get(SHIPPED, {}).get("metrics", {}).get("overall", {})
+    old = test.get("hybrid", {}).get("metrics", {}).get("overall", {})
     grep = test.get("grep", {}).get("metrics", {}).get("overall", {})
-    dense = test.get("dense", {}).get("metrics", {}).get("overall", {})
-    deltas = {}
     try:
-        for metric in ("recall@5", "mrr@10"):
-            deltas[metric] = paired_delta_ci(test["hybrid"]["per_query"], test["dense"]["per_query"], metric)
+        vs_old = paired_delta_ci(test[SHIPPED]["per_query"], test["hybrid"]["per_query"], "mrr@10")
+        vs_dense = paired_delta_ci(test[SHIPPED]["per_query"], test["dense"]["per_query"], "mrr@10")
+        vs_grep = paired_delta_ci(test[SHIPPED]["per_query"], test["grep"]["per_query"], "mrr@10")
     except KeyError:
-        deltas = {}
-    mrr_delta = deltas.get("mrr@10", {})
-    clear = mrr_delta.get("ci95", [0, 0])[1] < 0
-    dense_head = (
-        f"Dense-only beats the shipped hybrid on MRR@10 (paired {mrr_delta.get('mean_delta', 0):+.3f}, "
-        f"95% CI [{mrr_delta.get('ci95', [0, 0])[0]:+.3f}, {mrr_delta.get('ci95', [0, 0])[1]:+.3f}]); "
-        f"at Recall@5 the point estimate also favors dense ({dense.get('recall@5', 0):.3f} vs "
-        f"{hybrid.get('recall@5', 0):.3f}) but the paired CI grazes zero"
-        if clear
-        else f"Dense-only and the shipped hybrid are close (dense Recall@5 {dense.get('recall@5', 0):.3f} vs "
-        f"hybrid {hybrid.get('recall@5', 0):.3f})"
+        return "Incomplete results: run every system on the test split, then regenerate."
+    dense_clause = (
+        "is level with dense-only"
+        if vs_dense["ci95"][0] <= 0 <= vs_dense["ci95"][1]
+        else ("beats dense-only" if vs_dense["mean_delta"] > 0 else "trails dense-only")
     )
     return (
-        f"{dense_head}. Hybrid clearly beats the frozen one-pass grep baseline on this corpus "
-        f"(paired +{hybrid.get('recall@5', 0) - grep.get('recall@5', 0):.2f} Recall@5, "
-        f"+{hybrid.get('mrr@10', 0) - grep.get('mrr@10', 0):.2f} MRR@10), while grep is higher on "
-        f"heading-context in this sample — the per-category table and paired deltas say where."
+        f"Shipped BlooRecall (v1.1, rank fusion) reaches Recall@5 {shipped.get('recall@5', 0):.3f} / "
+        f"MRR@10 {shipped.get('mrr@10', 0):.3f}, up from v1.0's linear blend "
+        f"({old.get('recall@5', 0):.3f} / {old.get('mrr@10', 0):.3f}; paired MRR@10 "
+        f"{vs_old['mean_delta']:+.3f}, 95% CI [{vs_old['ci95'][0]:+.3f}, {vs_old['ci95'][1]:+.3f}]). "
+        f"It {dense_clause} on MRR@10 (paired {vs_dense['mean_delta']:+.3f}, CI "
+        f"[{vs_dense['ci95'][0]:+.3f}, {vs_dense['ci95'][1]:+.3f}]) and beats the frozen one-pass grep "
+        f"baseline (Recall@5 {grep.get('recall@5', 0):.3f}; paired MRR@10 {vs_grep['mean_delta']:+.3f}, "
+        f"CI [{vs_grep['ci95'][0]:+.3f}, {vs_grep['ci95'][1]:+.3f}])."
     )
 
 
@@ -200,8 +216,6 @@ def main() -> int:
     dev_next = next(iter(dev.values()))["n_queries"] if dev else 0
     if not test:
         raise SystemExit(f"no test results in {RESULTS}")
-    hybrid = test.get("hybrid", {}).get("metrics", {}).get("overall", {})
-    grep = test.get("grep", {}).get("metrics", {}).get("overall", {})
     corpus_files = next(iter(test.values()))["corpus"]["files"]
     commit = next(iter(test.values()))["git_commit"]
     env = next(iter(test.values()))["environment"]
@@ -213,10 +227,7 @@ def main() -> int:
         for key in ("main", "plain")
     }
 
-    takes = {
-        "hybrid_recall5": hybrid.get("recall@5", 0.0),
-        "grep_recall5": grep.get("recall@5", 0.0),
-    }
+    shipped_commit = test.get(SHIPPED, {}).get("git_commit", "unknown")
 
     prose = f"""# BlooRecall retrieval benchmark
 
@@ -247,11 +258,15 @@ default, and where?" — with the places it loses included.
 - **Split discipline:** dev/test ≈ 30/70 assigned deterministically from
   `sha256(query id)`. All design decisions were made on dev or on the corpus
   itself before any test run; the test split ran once per system, frozen, at
-  commit `{commit[:12]}`.
+  commit `{commit[:12]}`. **v1.1 (`hybrid-rrf`)** was chosen afterwards on dev
+  alone (the sweep below; `python3 -m bench.sweep` reruns it) and run once on
+  test at commit `{shipped_commit[:12]}`; the v1.0 rows were not re-run.
 - **Model/hardware:** {MODEL}; {env["cpu"] or env["machine"]}, {env["platform"]}.
   Index build: main (heading-aware) {build["main"] or "n/a"}s, plain-chunker ablation {build["plain"] or "n/a"}s
   for {next(iter(test.values()))["corpus"]["files"]} files. Query latency is single-process, warm
-  Ollama (`keep_alive`), one warmup query excluded.
+  Ollama (`keep_alive`), one warmup query excluded. The `hybrid-rrf` row was
+  timed in a later session ({test.get(SHIPPED, {}).get("environment", {}).get("platform", "n/a")}), so compare latency within a
+  session, not across rows from different ones; RRF itself adds ~2 ms of ranking per query.
 - **Metric definitions:** recall@k = a relevant doc (grade ≥ 1) in the top k;
   MRR@10 = 1/rank of the first relevant doc; nDCG@10 uses graded gains
   2^rel−1. CIs are percentile bootstrap over queries ({BOOTSTRAP_SAMPLES} resamples,
@@ -259,9 +274,8 @@ default, and where?" — with the places it loses included.
   embeds. Grep latency is our Python implementation, not the `rg` binary.
 - **Reproduce:**
   ```bash
-  git checkout bench-study
   python3 -m bench.manifest apply                      # set file times from MANIFEST.json
-  python3 -m unittest discover -s tests                # 65 tests, no network needed
+  python3 -m unittest discover -s tests                # 76 tests, no network needed
   python3 -m bench.run --system all --split dev --fresh
   python3 -m bench.run --system all --split test --fresh
   python3 -m bench.report                              # regenerate this file from results/
@@ -285,12 +299,33 @@ Read with the paired deltas — overlapping CIs are easy to misread:
 
 {category_table(test)}
 
-## Where hybrid does NOT win
+## v1.1: why the blend lost, and the fix
 
-See the per-category table above: the categories where `grep` matches or
-beats `hybrid` get named here with example queries (filled from the actual
-run below), and the paired-delta lines above quantify how often each system
-wins per query.
+v1.0 blended raw scores: `0.55·(cos+1)/2 + 0.45·bm25/max`. Over a query's top
+20 dense candidates, `(cos+1)/2` moves by a few hundredths while `bm25/max`
+spans nearly the whole [0, 1] range (medians in the sweep header below), so
+BM25 decided the order and the 0.55 dense weight was nominal. That is the
+whole of "dense-only beats hybrid" in the v1.0 rows.
+
+v1.1 fuses **ranks** instead (reciprocal-rank fusion, `"fusion": "rrf"`),
+which is scale-free, so the weight means what it says for any embedder or
+corpus size. The shipped setting is the conventional 50/50 with k=60, not the
+best dev cell: RRF sits within ~0.01 MRR@10 across weights 0.5-0.7 on 33 dev
+queries, which is noise, and the textbook default carries no tuning risk.
+Per-query min-max rescaling (`"minmax"`) does about as well on dev, but only
+at dense weights of 0.85 and up, where it is close to dense-only; it also
+anchors to the query's least similar chunk, so its effective weight drifts as
+the corpus grows. Dev did not separate the two; scale-robustness picked RRF.
+Keyword-only mode (Ollama down) is unchanged.
+
+{sweep_section()}
+
+## Where shipped BlooRecall does NOT win
+
+See the per-category table above: the categories where `grep` or dense-only
+matches or beats the shipped `{SHIPPED}` get named here with example queries
+(filled from the actual run below), and the paired-delta lines above quantify
+how often each system wins per query.
 
 {category_examples(test)}
 
@@ -304,6 +339,9 @@ wins per query.
   (it should be small; the corpus times are engineered, so this ablation is
   the honesty check on the `recency` category).
 - **dense vs bm25 vs hybrid**: the blend against its own ingredients.
+
+These ablations were run on the v1.0 linear blend and have not been re-run
+under RRF, so read them as statements about v1.0's components.
 
 Ablation wording discipline: with ~9-10 queries per category and Recall@5
 moving in steps of ~0.1, the ablations support "higher observed Recall@5"
@@ -325,6 +363,11 @@ observed Recall@5).
    (`AUDIT-NOTES.md`) quantifies but cannot eliminate template leakage.
 2. **One embedding model, one language, one machine.** qwen3-embedding:0.6b
    at 1024 dims; a stronger embedder could shift dense/hybrid numbers.
+   Corpus and queries are English only. An informal probe on a real mixed
+   English/Chinese notes folder (English queries, Chinese docs) suggested
+   that 50/50 fusion still gives BM25 half the vote when all it can match is
+   noise, so notes in several languages may want a higher dense_weight.
+   Not measured here.
 3. **Small test set.** {next(iter(test.values()))["n_queries"]} test queries; per-category cells are ~8-10
    queries, so per-category CIs are wide (shown in the results JSON). The
    paired deltas are the sharper instrument.
@@ -344,24 +387,13 @@ observed Recall@5).
    actually contributes (small), and grep ignores mtimes entirely.
 6. **Chunk-level index, file-level evaluation** on both sides: BlooRecall
    ranks its best chunk per file (shipped behavior); grep ranks files.
-7. **No tuning at all** — shipped weights are used as-is. That is the honest
-   "as shipped" question, but it means no one optimized BlooRecall for this
-   corpus, and the dev split was used only for sanity checks, not weight
-   search.
-
-## Proposed README section (NOT applied — for the owner to review)
-
-```markdown
-## Benchmark
-
-Against a frozen one-pass grep baseline (what an agent gets from one `rg`
-pass) on a 251-file synthetic corpus, shipped BlooRecall reaches Recall@5
-0.87 vs grep's 0.73 (MRR@10 0.77 vs 0.58); dense-only retrieval scores
-0.95/0.86, and grep is higher on heading-only queries (0.80 vs 0.70).
-Synthetic corpus and queries, single 0.6b embedding model, 63 test
-queries — treat the deltas, not the absolutes.
-![Recall@5 by system](docs/benchmark.svg)
-```
+7. **v1.0 had no tuning at all; v1.1's fusion was picked on dev.** The v1.1
+   choice came from about thirty settings on 33 dev queries (the 18 above,
+   plus RRF k and normalization variants tried first),
+   which is a forking-paths risk; the defence is that the pick is the
+   conventional RRF default rather than the dev-best cell, and that the
+   test split confirmed it once. A different corpus or embedder could still
+   prefer a different dense weight.
 
 ## Reproduction artifacts
 
@@ -379,49 +411,51 @@ queries — treat the deltas, not the absolutes.
 
 
 def category_examples(test: Dict[str, Dict[str, Any]]) -> str:
-    """Name categories where grep ≥ hybrid on recall@5, with real query ids."""
+    """Name categories where grep or dense-only ≥ the shipped system on recall@5, with real query ids."""
     lines = []
     categories = sorted(
         {cat for system in test.values() for cat in system["metrics"]["by_category"]}
     )
     losing = []
     for category in categories:
-        h = test.get("hybrid", {}).get("metrics", {}).get("by_category", {}).get(category, {}).get("recall@5")
+        h = test.get(SHIPPED, {}).get("metrics", {}).get("by_category", {}).get(category, {}).get("recall@5")
         g = test.get("grep", {}).get("metrics", {}).get("by_category", {}).get(category, {}).get("recall@5")
         if h is not None and g is not None and g >= h:
             losing.append((category, g, h))
     if losing:
-        lines.append("Categories where **grep ≥ hybrid** on Recall@5 (point estimates; small n per cell):")
+        lines.append(f"Categories where **grep ≥ {SHIPPED}** on Recall@5 (point estimates; small n per cell):")
         for category, g, h in losing:
-            lines.append(f"- `{category}`: grep {g:.3f} vs hybrid {h:.3f}. Example queries:")
+            lines.append(f"- `{category}`: grep {g:.3f} vs {SHIPPED} {h:.3f}. Example queries:")
             for example in example_queries(category, 3):
                 lines.append(f"    - ({example['id']}) \"{example['query']}\"")
     else:
-        lines.append("No category where grep ≥ hybrid on Recall@5 in this run; closest margins above.")
+        lines.append(f"No category where grep ≥ {SHIPPED} on Recall@5 in this run; closest margins above.")
     dense_losing = []
     for category in categories:
-        h = test.get("hybrid", {}).get("metrics", {}).get("by_category", {}).get(category, {}).get("recall@5")
+        h = test.get(SHIPPED, {}).get("metrics", {}).get("by_category", {}).get(category, {}).get("recall@5")
         d = test.get("dense", {}).get("metrics", {}).get("by_category", {}).get(category, {}).get("recall@5")
         if h is not None and d is not None and d > h:
             dense_losing.append((category, d, h))
+    if not dense_losing:
+        lines.append(f"\nNo category where dense-only > {SHIPPED} on Recall@5 in this run.")
     if dense_losing:
-        lines.append("\nCategories where **dense-only > shipped hybrid** on Recall@5 (the blend gives back embeddings' gains):")
+        lines.append(f"\nCategories where **dense-only > {SHIPPED}** on Recall@5 (the blend gives back embeddings' gains):")
         for category, d, h in dense_losing:
-            lines.append(f"- `{category}`: dense {d:.3f} vs hybrid {h:.3f}. Example queries:")
+            lines.append(f"- `{category}`: dense {d:.3f} vs {SHIPPED} {h:.3f}. Example queries:")
             for example in example_queries(category, 2):
                 lines.append(f"    - ({example['id']}) \"{example['query']}\"")
     winning = [
-        (cat, test["hybrid"]["metrics"]["by_category"][cat]["recall@5"],
+        (cat, test[SHIPPED]["metrics"]["by_category"][cat]["recall@5"],
          test["grep"]["metrics"]["by_category"][cat]["recall@5"])
         for cat in categories
-        if cat in test.get("hybrid", {}).get("metrics", {}).get("by_category", {})
+        if cat in test.get(SHIPPED, {}).get("metrics", {}).get("by_category", {})
         and cat in test.get("grep", {}).get("metrics", {}).get("by_category", {})
     ]
     if winning:
         winning.sort(key=lambda item: item[2] - item[1])
         best = winning[0]
         lines.append(
-            f"\nHybrid's clearest win: `{best[0]}` (hybrid {best[1]:.3f} vs grep {best[2]:.3f})."
+            f"\nClearest win over grep: `{best[0]}` ({SHIPPED} {best[1]:.3f} vs grep {best[2]:.3f})."
         )
     return "\n".join(lines)
 
