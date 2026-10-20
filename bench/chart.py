@@ -14,6 +14,8 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+# Fixed id salt and no timestamp, so re-running on unchanged results rewrites identical SVGs.
+matplotlib.rcParams["svg.hashsalt"] = "bloorecall-bench"
 import matplotlib.pyplot as plt  # noqa: E402
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -114,7 +116,7 @@ def headline_chart(results: dict[str, dict]) -> None:
         )
     fig.tight_layout()
     DOCS.mkdir(exist_ok=True)
-    fig.savefig(DOCS / "benchmark.svg", transparent=True)
+    fig.savefig(DOCS / "benchmark.svg", transparent=True, metadata={"Date": None})
     plt.close(fig)
 
 
@@ -144,7 +146,7 @@ def category_chart(results: dict[str, dict]) -> None:
     for text in legend.get_texts():
         text.set_color(TEXT)
     fig.tight_layout()
-    fig.savefig(DOCS / "benchmark-by-category.svg", transparent=True)
+    fig.savefig(DOCS / "benchmark-by-category.svg", transparent=True, metadata={"Date": None})
     plt.close(fig)
 
 

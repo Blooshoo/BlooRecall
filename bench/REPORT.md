@@ -220,6 +220,11 @@ observed Recall@5).
    (`AUDIT-NOTES.md`) quantifies but cannot eliminate template leakage.
 2. **One embedding model, one language, one machine.** qwen3-embedding:0.6b
    at 1024 dims; a stronger embedder could shift dense/hybrid numbers.
+   Corpus and queries are English only. An informal probe on a real mixed
+   English/Chinese notes folder (English queries, Chinese docs) suggested
+   that 50/50 fusion still gives BM25 half the vote when all it can match is
+   noise, so notes in several languages may want a higher dense_weight.
+   Not measured here.
 3. **Small test set.** 63 test queries; per-category cells are ~8-10
    queries, so per-category CIs are wide (shown in the results JSON). The
    paired deltas are the sharper instrument.
