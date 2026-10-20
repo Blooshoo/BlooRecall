@@ -222,12 +222,15 @@ def command_doctor(args: argparse.Namespace) -> int:
             print(f"index       OK  {metadata.get('chunk_count')} chunks, manifest {metadata.get('manifest_sha256', '')[:12]}")
 
     try:
-        import mcp  # noqa: F401
+        # Import the server module itself, not just `mcp`: an SDK whose server API moved
+        # imports fine as a package but cannot start the server.
+        from . import mcp_server  # noqa: F401
+        from importlib.metadata import version
 
-        print("mcp sdk     OK")
-    except ImportError:
+        print(f"mcp sdk     OK  {version('mcp')}")
+    except ImportError as error:
         problems += 1
-        print("mcp sdk     FAIL 'mcp' package not installed — pip install --user mcp")
+        print(f"mcp sdk     FAIL cannot load the MCP server ({error}) — pip install --user mcp")
     return 1 if problems else 0
 
 

@@ -374,7 +374,9 @@ class TestMcpServer(unittest.TestCase):
         tools = asyncio.run(server.list_tools())
         names = {tool.name for tool in tools}
         self.assertEqual(names, {"bloorecall_search"})
-        schema = next(tool for tool in tools if tool.name == "bloorecall_search").inputSchema
+        tool = next(tool for tool in tools if tool.name == "bloorecall_search")
+        # mcp 1.x spells it inputSchema, 2.x input_schema.
+        schema = getattr(tool, "input_schema", None) or tool.inputSchema
         self.assertIn("query", schema["properties"])
         self.assertIn("top_k", schema["properties"])
 
