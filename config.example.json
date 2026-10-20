@@ -62,16 +62,18 @@
     "denied_globs": []
   },
   "policies": {
-    "baseline-v0": {
-      "policy_id": "baseline-v0",
-      "dense_weight": 0.55,
+    "hybrid-rrf-v1": {
+      "policy_id": "hybrid-rrf-v1",
+      "fusion": "rrf",
+      "dense_weight": 0.5,
+      "rrf_k": 60,
       "recency_weight": 0.05,
       "metadata_weight": 0.15,
       "rerank_budget": 20,
       "top_k": 10
     }
   },
-  "active_policy": "baseline-v0",
+  "active_policy": "hybrid-rrf-v1",
   "search_defaults": {
     "top_k": 10,
     "max_top_k": 50,

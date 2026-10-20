@@ -28,9 +28,12 @@ Per-variant honesty notes (repeated in REPORT.md):
 - dense: BlooRecall with dense_weight=1.0 (query embedded; BM25 still
   computed but weighted out by the policy, exactly as the shipped policy
   arithmetic would do).
-- hybrid: BlooRecall exactly as shipped — baseline-v0 policy (dense 0.55 /
-  bm25 0.45 / recency 0.05 / metadata 0.15, coverage re-rank over the
-  top 20).
+- hybrid: BlooRecall v1.0 as shipped — baseline-v0 policy, a linear blend
+  of raw scores (dense 0.55 / bm25 0.45 / recency 0.05 / metadata 0.15,
+  coverage re-rank over the top 20). Kept as the frozen reference.
+- hybrid-rrf: BlooRecall v1.1 as shipped — hybrid-rrf-v1 policy: reciprocal-
+  rank fusion of the dense and BM25 orders (50/50, k=60), then the same
+  recency / metadata / coverage re-rank as baseline-v0.
 - hybrid-noheadings: baseline-v0 policy over an index built with the
   plain paragraph chunker (no heading breadcrumbs). Same embeddings.
 - hybrid-norerank: baseline-v0 with rerank_budget 0 (no coverage bonus).
@@ -225,10 +228,13 @@ def make_systems(config: Dict[str, Any], corpus_root: Path) -> Dict[str, Any]:
             resolved, "hybrid-norecency", policy_name="bench-norecency", embed_query=True,
             corpus_root=corpus_root,
         ),
+        "hybrid-rrf": BlooRecallSystem(
+            resolved, "hybrid-rrf", policy_name="hybrid-rrf-v1", embed_query=True, corpus_root=corpus_root
+        ),
     }
 
 
 # Indexes are shared across BlooRecall variants: one headings index serves
-# bm25/dense/hybrid/hybrid-norerank; the plain index serves hybrid-noheadings.
+# bm25/dense/hybrid/hybrid-norerank/hybrid-norecency/hybrid-rrf; the plain index serves hybrid-noheadings.
 def index_key_for(system_id: str) -> str:
     return "plain" if system_id == "hybrid-noheadings" else "main"

@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bloorecall import store  # noqa: E402
@@ -16,7 +18,7 @@ from bloorecall.config import index_path, load_config, manifest_path  # noqa: E4
 from bloorecall.corpus import chunk_markdown, chunk_text, secret_reason, walk_corpus  # noqa: E402
 from bloorecall.embeddings import EmbeddingUnavailable  # noqa: E402
 from bloorecall.indexer import refresh  # noqa: E402
-from bloorecall.search import PrivateQueryRefused, SearchEngine, snippet_for  # noqa: E402
+from bloorecall.search import PrivateQueryRefused, SearchEngine, _rrf, snippet_for  # noqa: E402
 from bloorecall.util import PROJECT_ROOT, ensure_write_target, tokens  # noqa: E402
 
 
@@ -327,11 +329,40 @@ class TestSearch(CorpusHarness):
         paths = [row["path"] for row in engine.search("kafka consumer lag", top_k=10)["results"]]
         self.assertTrue(any(path.endswith("new-note.md") for path in paths))
 
+    def test_linear_fusion_is_still_available(self) -> None:
+        policy = {**self.config["policies"]["baseline-v0"], "fusion": "linear"}
+        self.config = self.make_config(policies={"baseline-v0": policy})
+        self.refresh()
+        payload = self.engine().search("websocket reconnect backoff", top_k=3)
+        self.assertTrue(payload["results"][0]["path"].endswith("websocket-retry.md"))
+
     def test_snippet_windows_around_the_match(self) -> None:
         text = "alpha " * 100 + "the websocket retry budget is five " + "omega " * 100
         snippet = snippet_for(text, "websocket retry budget", 80)
         self.assertIn("websocket", snippet)
         self.assertLessEqual(len(snippet), 82)
+
+
+class TestFusion(unittest.TestCase):
+    # Chunk 0 is dense's pick, chunk 1 is BM25's. Cosines sit in a narrow band and BM25 spans a
+    # wide one, which is exactly the shape real embedders produce.
+    SIMILARITY = np.array([0.80, 0.70], dtype=np.float32)
+    LEXICAL = np.array([1.0, 10.0], dtype=np.float32)
+
+    def test_dense_weight_decides_which_list_wins(self) -> None:
+        self.assertEqual(int(np.argmax(_rrf(self.SIMILARITY, self.LEXICAL, 0.9, 60))), 0)
+        self.assertEqual(int(np.argmax(_rrf(self.SIMILARITY, self.LEXICAL, 0.1, 60))), 1)
+
+    def test_raw_score_blend_lets_bm25_overrule_a_heavy_dense_weight(self) -> None:
+        # The v1.0 failure RRF fixes: at 90% dense weight the linear blend still picks BM25's chunk.
+        linear = 0.9 * (self.SIMILARITY + 1) / 2 + 0.1 * self.LEXICAL / self.LEXICAL.max()
+        self.assertEqual(int(np.argmax(linear)), 1)
+
+    def test_best_chunk_scores_one_and_non_matches_get_no_keyword_credit(self) -> None:
+        fused = _rrf(np.array([0.9, 0.5, 0.1]), np.array([0.0, 0.0, 0.0]), 0.5, 60)
+        self.assertAlmostEqual(float(fused.max()), 1.0, places=6)
+        self.assertEqual([int(i) for i in np.argsort(-fused)], [0, 1, 2])
+        self.assertTrue(np.isfinite(_rrf(np.zeros(3), np.zeros(3), 0.0, 60)).all())
 
 
 class TestConfig(unittest.TestCase):
@@ -361,6 +392,16 @@ class TestConfig(unittest.TestCase):
             path = handle.name
         self.addCleanup(os.unlink, path)
         with self.assertRaises(RuntimeError):
+            load_config(path)
+
+    def test_unknown_fusion_is_rejected(self) -> None:
+        config = json.loads((PROJECT_ROOT / "config.example.json").read_text(encoding="utf-8"))
+        config["policies"][config["active_policy"]]["fusion"] = "vibes"
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(config, handle)
+            path = handle.name
+        self.addCleanup(os.unlink, path)
+        with self.assertRaisesRegex(RuntimeError, "fusion 'vibes'"):
             load_config(path)
 
 

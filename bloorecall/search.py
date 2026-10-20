@@ -34,6 +34,7 @@ PRIVATE_QUERY_MARKERS = {
 BM25_K1 = 1.5
 BM25_B = 0.75
 COVERAGE_BONUS = 0.18
+RRF_K = 60
 WHITESPACE_RE = re.compile(r"\s+")
 
 
@@ -193,12 +194,16 @@ class BlooRecallIndex:
         bm25_normalized = lexical / (maximum or 1.0)
 
         if query_vector is None:
-            dense_weight = 0.0
-            dense_normalized = np.zeros(self.count, dtype=np.float32)
+            relevance = bm25_normalized
         else:
             dense_weight = float(policy["dense_weight"])
-            query = np.asarray(query_vector, dtype=np.float32)
-            dense_normalized = (self.matrix @ query + 1.0) / 2.0
+            similarity = self.matrix @ np.asarray(query_vector, dtype=np.float32)
+            if policy.get("fusion", "rrf") == "linear":
+                relevance = (
+                    dense_weight * (similarity + 1.0) / 2.0 + (1.0 - dense_weight) * bm25_normalized
+                )
+            else:
+                relevance = _rrf(similarity, lexical, dense_weight, int(policy.get("rrf_k", RRF_K)))
 
         overlap_by_path = np.array(
             [
@@ -213,8 +218,7 @@ class BlooRecallIndex:
         recency = ((self.mtimes - self.min_mtime) / mtime_range).astype(np.float32)
 
         scores = (
-            dense_weight * dense_normalized
-            + (1.0 - dense_weight) * bm25_normalized
+            relevance
             + float(policy["recency_weight"]) * recency
             + float(policy["metadata_weight"]) * metadata_overlap
         )
@@ -265,6 +269,25 @@ class BlooRecallIndex:
             }
             for rank, (path_value, (score, index)) in enumerate(ranked[:top_k], start=1)
         ]
+
+
+def _reciprocal_ranks(values: np.ndarray, k: int) -> np.ndarray:
+    ranks = np.empty(values.size, dtype=np.float32)
+    ranks[np.argsort(-values, kind="stable")] = np.arange(1, values.size + 1, dtype=np.float32)
+    return 1.0 / (k + ranks)
+
+
+def _rrf(similarity: np.ndarray, lexical: np.ndarray, dense_weight: float, k: int) -> np.ndarray:
+    """Weighted reciprocal-rank fusion of the dense and BM25 orders, scaled so the best is 1.0.
+
+    Fusing ranks rather than raw scores is the point: cosine similarities from one embedder sit
+    in a narrow band (top candidates differ by ~0.05) while max-normalized BM25 spans [0, 1], so
+    a linear blend lets BM25 decide the order whatever dense_weight says. Ranks are scale-free,
+    so the weight means the same thing for any model or corpus size.
+    """
+    fused = dense_weight * _reciprocal_ranks(similarity, k)
+    fused += (1.0 - dense_weight) * np.where(lexical > 0, _reciprocal_ranks(lexical, k), 0.0)
+    return (fused / (float(fused.max()) or 1.0)).astype(np.float32)
 
 
 def _path_indices(paths: list[str]) -> list[int]:

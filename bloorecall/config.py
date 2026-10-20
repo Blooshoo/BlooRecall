@@ -23,6 +23,9 @@ REQUIRED_KEYS = (
     "search_defaults",
 )
 POLICY_KEYS = ("dense_weight", "recency_weight", "metadata_weight", "rerank_budget", "top_k")
+# "rrf" fuses the dense and BM25 rank orders; "linear" is the v1.0 raw-score blend, kept so old
+# results stay reproducible. A policy without the key gets "rrf".
+FUSIONS = ("rrf", "linear")
 
 
 def config_path(explicit: str | Path | None = None) -> Path:
@@ -83,16 +86,18 @@ def default_config(roots: list[dict[str, Any]]) -> dict[str, Any]:
             "denied_globs": [],
         },
         "policies": {
-            "baseline-v0": {
-                "policy_id": "baseline-v0",
-                "dense_weight": 0.55,
+            "hybrid-rrf-v1": {
+                "policy_id": "hybrid-rrf-v1",
+                "fusion": "rrf",
+                "dense_weight": 0.5,
+                "rrf_k": 60,
                 "recency_weight": 0.05,
                 "metadata_weight": 0.15,
                 "rerank_budget": 20,
                 "top_k": 10,
             }
         },
-        "active_policy": "baseline-v0",
+        "active_policy": "hybrid-rrf-v1",
         "search_defaults": {"top_k": 10, "max_top_k": 50, "snippet_chars": 240},
         "vector_cache_days": 14,
     }
@@ -109,6 +114,11 @@ def _validate_policies(data: dict[str, Any], path: Path) -> None:
         missing = [key for key in POLICY_KEYS if key not in policy]
         if missing:
             raise RuntimeError(f"policy '{name}' in {path} is missing: {', '.join(missing)}")
+        fusion = policy.get("fusion", "rrf")
+        if fusion not in FUSIONS:
+            raise RuntimeError(
+                f"policy '{name}' in {path} has fusion '{fusion}'; expected one of: {', '.join(FUSIONS)}"
+            )
 
 
 def active_policy(config: dict[str, Any], override: str | None = None) -> dict[str, Any]:
