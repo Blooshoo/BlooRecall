@@ -44,7 +44,7 @@ default, and where?" — with the places it loses included.
 - **Reproduce:**
   ```bash
   python3 -m bench.manifest apply                      # set file times from MANIFEST.json
-  python3 -m unittest discover -s tests                # 75 tests, no network needed
+  python3 -m unittest discover -s tests                # 76 tests, no network needed
   python3 -m bench.run --system all --split dev --fresh
   python3 -m bench.run --system all --split test --fresh
   python3 -m bench.report                              # regenerate this file from results/

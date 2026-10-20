@@ -40,7 +40,7 @@ Requires Python 3.12+, `numpy`, the `mcp` SDK, and a running local Ollama with a
 git clone <this repo> && cd bloorecall
 pip install numpy mcp
 ollama pull qwen3-embedding:0.6b          # any Ollama embedding model works; set it in config
-python3 -m unittest discover -s tests     # 75 tests, no network needed
+python3 -m unittest discover -s tests     # 76 tests, no network needed
 ```
 
 Put `bin/` on your `PATH` for a short command, or run `./bin/bloorecall` in place.
@@ -131,7 +131,7 @@ audit (exit 1 on drift).
 
 ## Status
 
-v1.1. 75 tests, all local. Born as a throwaway tool for personal knowledge-base research that turned
+v1.1. 76 tests, all local. Born as a throwaway tool for personal knowledge-base research that turned
 out to be genuinely useful, so it's shared in case it helps you too.
 
 ## License

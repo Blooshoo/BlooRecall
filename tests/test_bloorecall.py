@@ -446,6 +446,21 @@ class TestConfig(unittest.TestCase):
         np.testing.assert_allclose(spread, [0.0, 1.0, 0.5], atol=1e-6)
 
 
+class TestLaunchers(unittest.TestCase):
+    def test_launcher_ignores_a_bloorecall_package_in_the_working_directory(self) -> None:
+        import subprocess
+
+        decoy = Path(tempfile.mkdtemp(prefix="bloorecall-decoy-"))
+        self.addCleanup(shutil.rmtree, decoy, True)
+        write(decoy / "bloorecall" / "__init__.py", "raise SystemExit('decoy package imported')\n")
+        result = subprocess.run(
+            [str(PROJECT_ROOT / "bin" / "bloorecall"), "--help"],
+            cwd=decoy, capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("decoy", result.stdout + result.stderr)
+
+
 class TestMcpServer(unittest.TestCase):
     def test_server_exposes_bloorecall_search(self) -> None:
         import asyncio
