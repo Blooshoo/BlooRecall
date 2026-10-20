@@ -23,9 +23,14 @@ REQUIRED_KEYS = (
     "search_defaults",
 )
 POLICY_KEYS = ("dense_weight", "recency_weight", "metadata_weight", "rerank_budget", "top_k")
-# "rrf" fuses the dense and BM25 rank orders; "linear" is the v1.0 raw-score blend, kept so old
-# results stay reproducible. A policy without the key gets "rrf".
-FUSIONS = ("rrf", "linear")
+# How dense and BM25 evidence are combined (optional policy key "fusion").
+# "rrf" fuses the two rank orders (reciprocal-rank fusion); it is scale-free, so dense_weight
+# means what it says, and hybrid-rrf-v1 ships it. "raw" is the v0 score blend with cosine mapped
+# to (cos+1)/2: that squeezes every chunk into a narrow band while BM25 is max-normalized to
+# span [0, 1], so BM25 dominates whatever dense_weight says. "minmax" rescales the query's
+# similarities to span [0, 1] before blending. A policy without the key gets "raw", so a
+# policy id always names one behavior and baseline-v0's benchmark results stay reproducible.
+FUSION_MODES = ("raw", "minmax", "rrf")
 
 
 def config_path(explicit: str | Path | None = None) -> Path:
@@ -114,10 +119,10 @@ def _validate_policies(data: dict[str, Any], path: Path) -> None:
         missing = [key for key in POLICY_KEYS if key not in policy]
         if missing:
             raise RuntimeError(f"policy '{name}' in {path} is missing: {', '.join(missing)}")
-        fusion = policy.get("fusion", "rrf")
-        if fusion not in FUSIONS:
+        fusion = policy.get("fusion", "raw")
+        if fusion not in FUSION_MODES:
             raise RuntimeError(
-                f"policy '{name}' in {path} has fusion '{fusion}'; expected one of: {', '.join(FUSIONS)}"
+                f"policy '{name}' in {path} has fusion '{fusion}'; expected one of {', '.join(FUSION_MODES)}"
             )
 
 

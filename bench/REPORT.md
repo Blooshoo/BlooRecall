@@ -28,7 +28,7 @@ default, and where?" — with the places it loses included.
   `sha256(query id)`. All design decisions were made on dev or on the corpus
   itself before any test run; the test split ran once per system, frozen, at
   commit `84a7c22c5058`. **v1.1 (`hybrid-rrf`)** was chosen afterwards on dev
-  alone (`python3 -m bench.fusion_sweep` reprints that sweep) and run once on
+  alone (the sweep below; `python3 -m bench.sweep` reruns it) and run once on
   test at commit `fa918d399396`; the v1.0 rows were not re-run.
 - **Model/hardware:** qwen3-embedding:0.6b (Ollama, 1024-dim); Intel(R) Core(TM) i7-14700K, Linux-7.0.0-30-generic-x86_64-with-glibc2.39.
   Index build: main (heading-aware) 30.266s, plain-chunker ablation 22.064s
@@ -44,7 +44,7 @@ default, and where?" — with the places it loses included.
 - **Reproduce:**
   ```bash
   python3 -m bench.manifest apply                      # set file times from MANIFEST.json
-  python3 -m unittest discover -s tests                # 70 tests, no network needed
+  python3 -m unittest discover -s tests                # 75 tests, no network needed
   python3 -m bench.run --system all --split dev --fresh
   python3 -m bench.run --system all --split test --fresh
   python3 -m bench.report                              # regenerate this file from results/
@@ -118,18 +118,46 @@ Recall@5 per category (test split):
 
 v1.0 blended raw scores: `0.55·(cos+1)/2 + 0.45·bm25/max`. Over a query's top
 20 dense candidates, `(cos+1)/2` moves by a few hundredths while `bm25/max`
-spans nearly the whole [0, 1] range (`bench.fusion_sweep` prints the medians),
-so BM25 decided the order and the 0.55 dense weight was nominal. That is the
+spans nearly the whole [0, 1] range (medians in the sweep header below), so
+BM25 decided the order and the 0.55 dense weight was nominal. That is the
 whole of "dense-only beats hybrid" in the v1.0 rows.
 
-v1.1 fuses **ranks** instead (reciprocal-rank fusion), which is scale-free,
-so the weight means what it says for any embedder or corpus size. Choice made
-on dev: RRF at a plain 50/50 with the conventional k=60 (no tuned parameter,
-deliberately not the best dev cell; RRF was flat across k 10-60 and weights
-0.5-0.7). Per-corpus min-max normalization of the cosine also fixed dev, but
-it anchors to the corpus's worst chunk, so its effective weight drifts as the
-corpus grows; rejected for that reason. Keyword-only mode (Ollama down) is
-unchanged.
+v1.1 fuses **ranks** instead (reciprocal-rank fusion, `"fusion": "rrf"`),
+which is scale-free, so the weight means what it says for any embedder or
+corpus size. The shipped setting is the conventional 50/50 with k=60, not the
+best dev cell: RRF sits within ~0.01 MRR@10 across weights 0.5-0.7 on 33 dev
+queries, which is noise, and the textbook default carries no tuning risk.
+Per-query min-max rescaling (`"minmax"`) does about as well on dev, but only
+at dense weights of 0.85 and up, where it is close to dense-only; it also
+anchors to the query's least similar chunk, so its effective weight drifts as
+the corpus grows. Dev did not separate the two; scale-robustness picked RRF.
+Keyword-only mode (Ollama down) is unchanged.
+
+dev split, 33 queries, other fields from baseline-v0
+median score spread over each query's top 20 dense candidates: dense (cos+1)/2 0.069, bm25/max 0.994
+
+| fusion | dense_weight | recall@1 | recall@5 | mrr@10 | ndcg@10 |
+|---|---|---|---|---|---|
+| raw | 0.40 | 0.576 | 0.697 | 0.645 | 0.620 |
+| raw | 0.50 | 0.576 | 0.727 | 0.649 | 0.624 |
+| raw | 0.55 | 0.576 | 0.727 | 0.655 | 0.635 |
+| raw | 0.70 | 0.606 | 0.818 | 0.696 | 0.664 |
+| raw | 0.85 | 0.667 | 0.818 | 0.738 | 0.711 |
+| raw | 1.00 | 0.727 | 0.818 | 0.770 | 0.751 |
+| minmax | 0.40 | 0.636 | 0.849 | 0.714 | 0.669 |
+| minmax | 0.50 | 0.667 | 0.849 | 0.736 | 0.691 |
+| minmax | 0.55 | 0.697 | 0.849 | 0.757 | 0.713 |
+| minmax | 0.70 | 0.727 | 0.879 | 0.783 | 0.749 |
+| minmax | 0.85 | 0.788 | 0.909 | 0.820 | 0.784 |
+| minmax | 1.00 | 0.788 | 0.909 | 0.819 | 0.783 |
+| rrf | 0.40 | 0.758 | 0.849 | 0.790 | 0.713 |
+| rrf | 0.50 | 0.788 | 0.879 | 0.810 | 0.756 |
+| rrf | 0.55 | 0.788 | 0.879 | 0.817 | 0.774 |
+| rrf | 0.70 | 0.788 | 0.849 | 0.822 | 0.783 | ←
+| rrf | 0.85 | 0.727 | 0.909 | 0.784 | 0.769 |
+| rrf | 1.00 | 0.667 | 0.849 | 0.758 | 0.750 |
+
+← best MRR@10 (ties broken by Recall@5).
 
 ## Where shipped BlooRecall does NOT win
 
@@ -212,9 +240,10 @@ observed Recall@5).
 6. **Chunk-level index, file-level evaluation** on both sides: BlooRecall
    ranks its best chunk per file (shipped behavior); grep ranks files.
 7. **v1.0 had no tuning at all; v1.1's fusion was picked on dev.** The v1.1
-   choice came from a sweep of about thirty settings over 33 dev queries,
+   choice came from about thirty settings on 33 dev queries (the 18 above,
+   plus RRF k and normalization variants tried first),
    which is a forking-paths risk; the defence is that the pick is the
-   parameter-free RRF default rather than the dev-best cell, and that the
+   conventional RRF default rather than the dev-best cell, and that the
    test split confirmed it once. A different corpus or embedder could still
    prefer a different dense weight.
 

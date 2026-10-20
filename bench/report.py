@@ -19,6 +19,7 @@ from bloorecall.util import PROJECT_ROOT
 RESULTS = PROJECT_ROOT / "bench" / "results"
 REPORT = PROJECT_ROOT / "bench" / "REPORT.md"
 QUERIES = PROJECT_ROOT / "bench" / "queries.jsonl"
+SWEEP = RESULTS / "sweep" / "dev.json"
 
 SYSTEM_ORDER = ["grep", "filename", "bm25", "dense", "hybrid", "hybrid-rrf", "hybrid-noheadings", "hybrid-norerank", "hybrid-norecency"]
 # The system the "where it does NOT win" section holds to account: whatever ships today.
@@ -33,6 +34,7 @@ SYSTEM_DESC = {
     "hybrid-noheadings": "hybrid over an index built with the plain paragraph chunker (opt-in chunker_override='plain'), no heading breadcrumbs. Same embeddings, same policy.",
     "hybrid-norerank": "hybrid with rerank_budget 0 (no term-coverage re-rank).",
     "hybrid-norecency": "hybrid with recency_weight 0. Quantifies how much the engineered file times contribute through the recency feature (metadata weight unchanged).",
+    "hybrid-v1": "hybrid with fusion 'minmax': dense similarities rescaled per query to span [0, 1] like BM25, instead of v0's (cos+1)/2. Same weights as shipped; isolates the fusion change.",
 }
 CATEGORY_DESC = {
     "paraphrase": "query avoids the doc's wording (vocabulary gaps)",
@@ -116,12 +118,13 @@ def category_table(test: Dict[str, Dict[str, Any]], metric: str = "recall@5") ->
     categories = sorted(
         {cat for system in test.values() for cat in system["metrics"]["by_category"]}
     )
-    header = "| category | " + " | ".join(SYSTEM_ORDER) + " |"
-    sep = "|---|" + "---|" * len(SYSTEM_ORDER)
+    systems = [system for system in SYSTEM_ORDER if system in test]
+    header = "| category | " + " | ".join(systems) + " |"
+    sep = "|---|" + "---|" * len(systems)
     lines = [f"Recall@5 per category (test split):", "", header, sep]
     for category in categories:
         cells = []
-        for system in SYSTEM_ORDER:
+        for system in systems:
             value = test.get(system, {}).get("metrics", {}).get("by_category", {}).get(category, {}).get(metric)
             cells.append("—" if value is None else fmt_cell(value))
         lines.append(f"| {category} ({CATEGORY_DESC.get(category, '')}) | " + " | ".join(cells) + " |")
@@ -169,6 +172,15 @@ def example_queries(category: str, count: int = 3, split: str | None = "test") -
         {"id": row["id"], "query": row["query"]}
         for row in (preferred or fallback)
     ][:count]
+
+
+def sweep_section() -> str:
+    """The committed dev sweep (bench.sweep), or a pointer to it when it hasn't been run."""
+    if not SWEEP.exists():
+        return "_No sweep results yet: run `python3 -m bench.sweep` to write them._"
+    from bench.sweep import format_table
+
+    return format_table(json.loads(SWEEP.read_text(encoding="utf-8")), advice=False)
 
 
 def one_sentence_result(test: Dict[str, Dict[str, Any]]) -> str:
@@ -247,7 +259,7 @@ default, and where?" — with the places it loses included.
   `sha256(query id)`. All design decisions were made on dev or on the corpus
   itself before any test run; the test split ran once per system, frozen, at
   commit `{commit[:12]}`. **v1.1 (`hybrid-rrf`)** was chosen afterwards on dev
-  alone (`python3 -m bench.fusion_sweep` reprints that sweep) and run once on
+  alone (the sweep below; `python3 -m bench.sweep` reruns it) and run once on
   test at commit `{shipped_commit[:12]}`; the v1.0 rows were not re-run.
 - **Model/hardware:** {MODEL}; {env["cpu"] or env["machine"]}, {env["platform"]}.
   Index build: main (heading-aware) {build["main"] or "n/a"}s, plain-chunker ablation {build["plain"] or "n/a"}s
@@ -263,7 +275,7 @@ default, and where?" — with the places it loses included.
 - **Reproduce:**
   ```bash
   python3 -m bench.manifest apply                      # set file times from MANIFEST.json
-  python3 -m unittest discover -s tests                # 70 tests, no network needed
+  python3 -m unittest discover -s tests                # 75 tests, no network needed
   python3 -m bench.run --system all --split dev --fresh
   python3 -m bench.run --system all --split test --fresh
   python3 -m bench.report                              # regenerate this file from results/
@@ -291,18 +303,22 @@ Read with the paired deltas — overlapping CIs are easy to misread:
 
 v1.0 blended raw scores: `0.55·(cos+1)/2 + 0.45·bm25/max`. Over a query's top
 20 dense candidates, `(cos+1)/2` moves by a few hundredths while `bm25/max`
-spans nearly the whole [0, 1] range (`bench.fusion_sweep` prints the medians),
-so BM25 decided the order and the 0.55 dense weight was nominal. That is the
+spans nearly the whole [0, 1] range (medians in the sweep header below), so
+BM25 decided the order and the 0.55 dense weight was nominal. That is the
 whole of "dense-only beats hybrid" in the v1.0 rows.
 
-v1.1 fuses **ranks** instead (reciprocal-rank fusion), which is scale-free,
-so the weight means what it says for any embedder or corpus size. Choice made
-on dev: RRF at a plain 50/50 with the conventional k=60 (no tuned parameter,
-deliberately not the best dev cell; RRF was flat across k 10-60 and weights
-0.5-0.7). Per-corpus min-max normalization of the cosine also fixed dev, but
-it anchors to the corpus's worst chunk, so its effective weight drifts as the
-corpus grows; rejected for that reason. Keyword-only mode (Ollama down) is
-unchanged.
+v1.1 fuses **ranks** instead (reciprocal-rank fusion, `"fusion": "rrf"`),
+which is scale-free, so the weight means what it says for any embedder or
+corpus size. The shipped setting is the conventional 50/50 with k=60, not the
+best dev cell: RRF sits within ~0.01 MRR@10 across weights 0.5-0.7 on 33 dev
+queries, which is noise, and the textbook default carries no tuning risk.
+Per-query min-max rescaling (`"minmax"`) does about as well on dev, but only
+at dense weights of 0.85 and up, where it is close to dense-only; it also
+anchors to the query's least similar chunk, so its effective weight drifts as
+the corpus grows. Dev did not separate the two; scale-robustness picked RRF.
+Keyword-only mode (Ollama down) is unchanged.
+
+{sweep_section()}
 
 ## Where shipped BlooRecall does NOT win
 
@@ -367,9 +383,10 @@ observed Recall@5).
 6. **Chunk-level index, file-level evaluation** on both sides: BlooRecall
    ranks its best chunk per file (shipped behavior); grep ranks files.
 7. **v1.0 had no tuning at all; v1.1's fusion was picked on dev.** The v1.1
-   choice came from a sweep of about thirty settings over 33 dev queries,
+   choice came from about thirty settings on 33 dev queries (the 18 above,
+   plus RRF k and normalization variants tried first),
    which is a forking-paths risk; the defence is that the pick is the
-   parameter-free RRF default rather than the dev-best cell, and that the
+   conventional RRF default rather than the dev-best cell, and that the
    test split confirmed it once. A different corpus or embedder could still
    prefer a different dense weight.
 

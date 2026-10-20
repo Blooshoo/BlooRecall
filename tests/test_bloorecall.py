@@ -14,11 +14,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bloorecall import store  # noqa: E402
-from bloorecall.config import index_path, load_config, manifest_path  # noqa: E402
+from bloorecall.config import active_policy, index_path, load_config, manifest_path  # noqa: E402
 from bloorecall.corpus import chunk_markdown, chunk_text, secret_reason, walk_corpus  # noqa: E402
 from bloorecall.embeddings import EmbeddingUnavailable  # noqa: E402
 from bloorecall.indexer import refresh  # noqa: E402
-from bloorecall.search import PrivateQueryRefused, SearchEngine, _rrf, snippet_for  # noqa: E402
+from bloorecall.search import PrivateQueryRefused, SearchEngine, _dense_scale, _rrf, snippet_for  # noqa: E402
 from bloorecall.util import PROJECT_ROOT, ensure_write_target, tokens  # noqa: E402
 
 
@@ -329,11 +329,46 @@ class TestSearch(CorpusHarness):
         paths = [row["path"] for row in engine.search("kafka consumer lag", top_k=10)["results"]]
         self.assertTrue(any(path.endswith("new-note.md") for path in paths))
 
-    def test_linear_fusion_is_still_available(self) -> None:
-        policy = {**self.config["policies"]["baseline-v0"], "fusion": "linear"}
-        self.config = self.make_config(policies={"baseline-v0": policy})
+    def test_minmax_fusion_lets_meaning_beat_a_lone_keyword_hit(self) -> None:
+        # A paraphrase in miniature: the query's meaning (its vector) is the websocket note,
+        # but its only keyword hits the backup runbook. Recency, metadata and re-rank are
+        # off so the blend itself decides.
+        self.refresh()
+        index = self.engine().index
+        vector = FakeEmbedder().embed_one(
+            "WebSocket retry gateway reconnects exponential backoff jitter budget attempts socket"
+        )
+        policy = {
+            "policy_id": "t", "dense_weight": 0.55, "recency_weight": 0.0,
+            "metadata_weight": 0.0, "rerank_budget": 0, "top_k": 3,
+        }
+
+        def top(fusion: str) -> str:
+            return index.rank("restic", vector, {**policy, "fusion": fusion})[0]["path"]
+
+        # (cos+1)/2 hands every chunk at least ~0.5 of the dense weight, so BM25's max-normalized
+        # 1.0 on the keyword hit outweighs a perfect embedding match.
+        self.assertTrue(top("raw").endswith("backup-runbook.md"))
+        self.assertTrue(top("minmax").endswith("websocket-retry.md"))
+
+    def test_policy_without_fusion_ranks_exactly_like_raw(self) -> None:
+        self.refresh()
+        index = self.engine().index
+        policy = active_policy(self.config)
+        vector = FakeEmbedder().embed_one("websocket backoff")
+        legacy = index.rank("websocket backoff", vector, policy)
+        explicit = index.rank("websocket backoff", vector, {**policy, "fusion": "raw"})
+        self.assertEqual(legacy, explicit)
+
+    def test_rrf_policy_finds_the_right_file(self) -> None:
+        policy = {
+            "policy_id": "hybrid-rrf-v1", "fusion": "rrf", "dense_weight": 0.5, "rrf_k": 60,
+            "recency_weight": 0.05, "metadata_weight": 0.15, "rerank_budget": 20, "top_k": 10,
+        }
+        self.config = self.make_config(active_policy="hybrid-rrf-v1", policies={"hybrid-rrf-v1": policy})
         self.refresh()
         payload = self.engine().search("websocket reconnect backoff", top_k=3)
+        self.assertEqual(payload["policy"], "hybrid-rrf-v1")
         self.assertTrue(payload["results"][0]["path"].endswith("websocket-retry.md"))
 
     def test_snippet_windows_around_the_match(self) -> None:
@@ -404,6 +439,12 @@ class TestConfig(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "fusion 'vibes'"):
             load_config(path)
 
+    def test_minmax_scaling_handles_a_flat_query(self) -> None:
+        flat = np.full(4, 0.3, dtype=np.float32)
+        self.assertEqual(_dense_scale(flat, "minmax").tolist(), [0.0] * 4)
+        spread = _dense_scale(np.array([0.2, 0.6, 0.4], dtype=np.float32), "minmax")
+        np.testing.assert_allclose(spread, [0.0, 1.0, 0.5], atol=1e-6)
+
 
 class TestMcpServer(unittest.TestCase):
     def test_server_exposes_bloorecall_search(self) -> None:
@@ -415,7 +456,9 @@ class TestMcpServer(unittest.TestCase):
         tools = asyncio.run(server.list_tools())
         names = {tool.name for tool in tools}
         self.assertEqual(names, {"bloorecall_search"})
-        schema = next(tool for tool in tools if tool.name == "bloorecall_search").inputSchema
+        tool = next(tool for tool in tools if tool.name == "bloorecall_search")
+        # mcp 1.x spells it inputSchema, 2.x input_schema.
+        schema = getattr(tool, "input_schema", None) or tool.inputSchema
         self.assertIn("query", schema["properties"])
         self.assertIn("top_k", schema["properties"])
 

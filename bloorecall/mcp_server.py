@@ -1,8 +1,13 @@
 import os
 from typing import Annotated, Any, Optional
 
-from mcp.server.fastmcp import FastMCP
 from pydantic import Field
+
+try:
+    # mcp 2.x renamed FastMCP to MCPServer; the constructor, @tool and run() are unchanged.
+    from mcp.server.mcpserver import MCPServer as FastMCP
+except ImportError:
+    from mcp.server.fastmcp import FastMCP
 
 from .config import load_config
 from .search import PrivateQueryRefused, SearchEngine

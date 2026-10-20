@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from . import store
-from .config import active_policy, index_path
+from .config import FUSION_MODES, active_policy, index_path
 from .embeddings import EmbeddingUnavailable, OllamaEmbedder
 from .trust import TrustVerdict, verify_path
 from .util import tokens, utc_iso
@@ -198,12 +198,14 @@ class BlooRecallIndex:
         else:
             dense_weight = float(policy["dense_weight"])
             similarity = self.matrix @ np.asarray(query_vector, dtype=np.float32)
-            if policy.get("fusion", "rrf") == "linear":
-                relevance = (
-                    dense_weight * (similarity + 1.0) / 2.0 + (1.0 - dense_weight) * bm25_normalized
-                )
-            else:
+            fusion = policy.get("fusion", "raw")
+            if fusion == "rrf":
                 relevance = _rrf(similarity, lexical, dense_weight, int(policy.get("rrf_k", RRF_K)))
+            else:
+                relevance = (
+                    dense_weight * _dense_scale(similarity, fusion)
+                    + (1.0 - dense_weight) * bm25_normalized
+                )
 
         overlap_by_path = np.array(
             [
@@ -271,6 +273,20 @@ class BlooRecallIndex:
         ]
 
 
+def _dense_scale(similarity: np.ndarray, fusion: str) -> np.ndarray:
+    """Put cosine similarities on BM25's [0, 1] scale; see FUSION_MODES in config."""
+    if fusion == "raw":
+        return (similarity + 1.0) / 2.0
+    if fusion == "minmax":
+        low = float(similarity.min())
+        spread = float(similarity.max()) - low
+        if spread <= 0.0:
+            # Every chunk is equally similar: dense carries no ranking signal.
+            return np.zeros_like(similarity)
+        return (similarity - low) / spread
+    raise ValueError(f"unknown fusion mode '{fusion}'; expected one of {', '.join(FUSION_MODES)}")
+
+
 def _reciprocal_ranks(values: np.ndarray, k: int) -> np.ndarray:
     ranks = np.empty(values.size, dtype=np.float32)
     ranks[np.argsort(-values, kind="stable")] = np.arange(1, values.size + 1, dtype=np.float32)
@@ -282,8 +298,10 @@ def _rrf(similarity: np.ndarray, lexical: np.ndarray, dense_weight: float, k: in
 
     Fusing ranks rather than raw scores is the point: cosine similarities from one embedder sit
     in a narrow band (top candidates differ by ~0.05) while max-normalized BM25 spans [0, 1], so
-    a linear blend lets BM25 decide the order whatever dense_weight says. Ranks are scale-free,
-    so the weight means the same thing for any model or corpus size.
+    the raw blend lets BM25 decide the order whatever dense_weight says. Ranks are scale-free, so
+    the weight means the same thing for any model or corpus size (minmax rescaling fixes the
+    scale too, but anchors to the query's least similar chunk, so its effective weight drifts as the
+    corpus grows).
     """
     fused = dense_weight * _reciprocal_ranks(similarity, k)
     fused += (1.0 - dense_weight) * np.where(lexical > 0, _reciprocal_ranks(lexical, k), 0.0)

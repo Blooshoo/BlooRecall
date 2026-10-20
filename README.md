@@ -40,7 +40,7 @@ Requires Python 3.12+, `numpy`, the `mcp` SDK, and a running local Ollama with a
 git clone <this repo> && cd bloorecall
 pip install numpy mcp
 ollama pull qwen3-embedding:0.6b          # any Ollama embedding model works; set it in config
-python3 -m unittest discover -s tests     # 70 tests, no network needed
+python3 -m unittest discover -s tests     # 75 tests, no network needed
 ```
 
 Put `bin/` on your `PATH` for a short command, or run `./bin/bloorecall` in place.
@@ -102,7 +102,8 @@ synthetic corpus, BlooRecall as shipped reaches **Recall@5 0.97 vs grep's 0.73**
 v1.0 shipped a linear blend that, it turned out, let BM25 overrule the embeddings (0.87 / 0.77,
 behind embeddings alone at 0.95 / 0.86). v1.1 fuses ranks instead: it sits level with
 embeddings-only on meaning-style queries and keeps keyword search's edge on exact identifiers.
-The fusion was picked on the dev split and confirmed once on test; the report has the diagnosis.
+The fusion was picked on the dev split (`python3 -m bench.sweep`) and confirmed once on test;
+the report has the diagnosis.
 
 ![Recall@5 by system](docs/benchmark.svg)
 
@@ -114,9 +115,13 @@ red-team review and one-command reproduction are in [`bench/REPORT.md`](bench/RE
 
 `config.json` (write a starter with `bloorecall init`). Key fields: `corpus_roots` (read-only
 folders with a `label` and `max_files`), `allowed_extensions`, `embedding` (Ollama model +
-endpoint), `policies` / `active_policy` (retrieval weights; `"fusion": "linear"` restores the v1.0
-blend), `exclusions`, `search_defaults`. All
-paths are absolute; the index lives under the project's `var/`.
+endpoint), `policies` / `active_policy` (retrieval weights and `fusion`: `rrf`, or `raw` for the
+v1.0 blend), `exclusions`, `search_defaults`. All paths are absolute; the index lives under the
+project's `var/`.
+
+**Upgrading from v1.0:** a policy without a `fusion` key keeps the v1.0 blend, so a policy id
+always means one behavior. To get v1.1's ranking, copy the `hybrid-rrf-v1` block from
+`config.example.json` into your `policies` and set `"active_policy": "hybrid-rrf-v1"`.
 
 ## Keeping it fresh
 
@@ -126,7 +131,7 @@ audit (exit 1 on drift).
 
 ## Status
 
-v1.1. 70 tests, all local. Born as a throwaway tool for personal knowledge-base research that turned
+v1.1. 75 tests, all local. Born as a throwaway tool for personal knowledge-base research that turned
 out to be genuinely useful, so it's shared in case it helps you too.
 
 ## License

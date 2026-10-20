@@ -181,6 +181,13 @@ class BlooRecallSystem:
             vector = self.embedder.embed_one(query)
         policy = dict(self.policy)
         policy["top_k"] = top_k
+        return self.search_with_vector(query, vector, policy)
+
+    def search_with_vector(
+        self, query: str, vector: Optional[List[float]], policy: Dict[str, Any]
+    ) -> List[str]:
+        """Rank with an already-embedded query under an explicit policy (bench.sweep)."""
+        assert self.index is not None
         rows = self.index.rank(query, vector, policy)
         results = []
         for row in rows:
