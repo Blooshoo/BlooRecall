@@ -20,7 +20,7 @@ RESULTS = PROJECT_ROOT / "bench" / "results"
 REPORT = PROJECT_ROOT / "bench" / "REPORT.md"
 QUERIES = PROJECT_ROOT / "bench" / "queries.jsonl"
 
-SYSTEM_ORDER = ["grep", "filename", "bm25", "dense", "hybrid", "hybrid-noheadings", "hybrid-norerank", "hybrid-norecency"]
+SYSTEM_ORDER = ["grep", "filename", "bm25", "dense", "hybrid", "hybrid-noheadings", "hybrid-norerank", "hybrid-norecency", "hybrid-v1"]
 SYSTEM_DESC = {
     "grep": "grep — case-insensitive substring of the query's non-stopword terms; rank by distinct terms matched, then matching lines. Our Python stand-in for the rg pass an agent would run (not rg's C speed).",
     "filename": "filename — same terms matched against the file path only.",
@@ -30,6 +30,7 @@ SYSTEM_DESC = {
     "hybrid-noheadings": "hybrid over an index built with the plain paragraph chunker (opt-in chunker_override='plain'), no heading breadcrumbs. Same embeddings, same policy.",
     "hybrid-norerank": "hybrid with rerank_budget 0 (no term-coverage re-rank).",
     "hybrid-norecency": "hybrid with recency_weight 0. Quantifies how much the engineered file times contribute through the recency feature (metadata weight unchanged).",
+    "hybrid-v1": "hybrid with fusion 'minmax': dense similarities rescaled per query to span [0, 1] like BM25, instead of v0's (cos+1)/2. Same weights as shipped; isolates the fusion change.",
 }
 CATEGORY_DESC = {
     "paraphrase": "query avoids the doc's wording (vocabulary gaps)",
@@ -113,12 +114,13 @@ def category_table(test: Dict[str, Dict[str, Any]], metric: str = "recall@5") ->
     categories = sorted(
         {cat for system in test.values() for cat in system["metrics"]["by_category"]}
     )
-    header = "| category | " + " | ".join(SYSTEM_ORDER) + " |"
-    sep = "|---|" + "---|" * len(SYSTEM_ORDER)
+    systems = [system for system in SYSTEM_ORDER if system in test]
+    header = "| category | " + " | ".join(systems) + " |"
+    sep = "|---|" + "---|" * len(systems)
     lines = [f"Recall@5 per category (test split):", "", header, sep]
     for category in categories:
         cells = []
-        for system in SYSTEM_ORDER:
+        for system in systems:
             value = test.get(system, {}).get("metrics", {}).get("by_category", {}).get(category, {}).get(metric)
             cells.append("—" if value is None else fmt_cell(value))
         lines.append(f"| {category} ({CATEGORY_DESC.get(category, '')}) | " + " | ".join(cells) + " |")
@@ -127,7 +129,8 @@ def category_table(test: Dict[str, Dict[str, Any]], metric: str = "recall@5") ->
 
 def paired_section(test: Dict[str, Dict[str, Any]]) -> str:
     lines = ["", "### Paired deltas (same queries, per-query differences)", ""]
-    pairs = [("hybrid", "grep"), ("hybrid", "bm25"), ("hybrid", "dense"), ("hybrid", "hybrid-noheadings")]
+    pairs = [("hybrid", "grep"), ("hybrid", "bm25"), ("hybrid", "dense"), ("hybrid", "hybrid-noheadings"),
+             ("hybrid-v1", "hybrid"), ("hybrid-v1", "dense")]
     for metric in ("recall@5", "mrr@10", "ndcg@10"):
         for a, b in pairs:
             if a not in test or b not in test:

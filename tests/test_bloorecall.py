@@ -9,14 +9,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bloorecall import store  # noqa: E402
-from bloorecall.config import index_path, load_config, manifest_path  # noqa: E402
+from bloorecall.config import active_policy, index_path, load_config, manifest_path  # noqa: E402
 from bloorecall.corpus import chunk_markdown, chunk_text, secret_reason, walk_corpus  # noqa: E402
 from bloorecall.embeddings import EmbeddingUnavailable  # noqa: E402
 from bloorecall.indexer import refresh  # noqa: E402
-from bloorecall.search import PrivateQueryRefused, SearchEngine, snippet_for  # noqa: E402
+from bloorecall.search import PrivateQueryRefused, SearchEngine, _dense_scale, snippet_for  # noqa: E402
 from bloorecall.util import PROJECT_ROOT, ensure_write_target, tokens  # noqa: E402
 
 
@@ -327,6 +329,37 @@ class TestSearch(CorpusHarness):
         paths = [row["path"] for row in engine.search("kafka consumer lag", top_k=10)["results"]]
         self.assertTrue(any(path.endswith("new-note.md") for path in paths))
 
+    def test_minmax_fusion_lets_meaning_beat_a_lone_keyword_hit(self) -> None:
+        # A paraphrase in miniature: the query's meaning (its vector) is the websocket note,
+        # but its only keyword hits the backup runbook. Recency, metadata and re-rank are
+        # off so the blend itself decides.
+        self.refresh()
+        index = self.engine().index
+        vector = FakeEmbedder().embed_one(
+            "WebSocket retry gateway reconnects exponential backoff jitter budget attempts socket"
+        )
+        policy = {
+            "policy_id": "t", "dense_weight": 0.55, "recency_weight": 0.0,
+            "metadata_weight": 0.0, "rerank_budget": 0, "top_k": 3,
+        }
+
+        def top(fusion: str) -> str:
+            return index.rank("restic", vector, {**policy, "fusion": fusion})[0]["path"]
+
+        # (cos+1)/2 hands every chunk at least ~0.5 of the dense weight, so BM25's max-normalized
+        # 1.0 on the keyword hit outweighs a perfect embedding match.
+        self.assertTrue(top("raw").endswith("backup-runbook.md"))
+        self.assertTrue(top("minmax").endswith("websocket-retry.md"))
+
+    def test_policy_without_fusion_ranks_exactly_like_raw(self) -> None:
+        self.refresh()
+        index = self.engine().index
+        policy = active_policy(self.config)
+        vector = FakeEmbedder().embed_one("websocket backoff")
+        legacy = index.rank("websocket backoff", vector, policy)
+        explicit = index.rank("websocket backoff", vector, {**policy, "fusion": "raw"})
+        self.assertEqual(legacy, explicit)
+
     def test_snippet_windows_around_the_match(self) -> None:
         text = "alpha " * 100 + "the websocket retry budget is five " + "omega " * 100
         snippet = snippet_for(text, "websocket retry budget", 80)
@@ -362,6 +395,22 @@ class TestConfig(unittest.TestCase):
         self.addCleanup(os.unlink, path)
         with self.assertRaises(RuntimeError):
             load_config(path)
+
+    def test_unknown_fusion_mode_is_rejected_at_load(self) -> None:
+        config = json.loads((PROJECT_ROOT / "config.example.json").read_text(encoding="utf-8"))
+        config["policies"]["hybrid-v1"]["fusion"] = "minmaxx"
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json.dump(config, handle)
+            path = handle.name
+        self.addCleanup(os.unlink, path)
+        with self.assertRaisesRegex(RuntimeError, "minmaxx"):
+            load_config(path)
+
+    def test_minmax_scaling_handles_a_flat_query(self) -> None:
+        flat = np.full(4, 0.3, dtype=np.float32)
+        self.assertEqual(_dense_scale(flat, "minmax").tolist(), [0.0] * 4)
+        spread = _dense_scale(np.array([0.2, 0.6, 0.4], dtype=np.float32), "minmax")
+        np.testing.assert_allclose(spread, [0.0, 1.0, 0.5], atol=1e-6)
 
 
 class TestMcpServer(unittest.TestCase):

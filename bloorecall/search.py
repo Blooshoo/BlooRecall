@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 
 from . import store
-from .config import active_policy, index_path
+from .config import FUSION_MODES, active_policy, index_path
 from .embeddings import EmbeddingUnavailable, OllamaEmbedder
 from .trust import TrustVerdict, verify_path
 from .util import tokens, utc_iso
@@ -198,7 +198,7 @@ class BlooRecallIndex:
         else:
             dense_weight = float(policy["dense_weight"])
             query = np.asarray(query_vector, dtype=np.float32)
-            dense_normalized = (self.matrix @ query + 1.0) / 2.0
+            dense_normalized = _dense_scale(self.matrix @ query, policy.get("fusion", "raw"))
 
         overlap_by_path = np.array(
             [
@@ -265,6 +265,20 @@ class BlooRecallIndex:
             }
             for rank, (path_value, (score, index)) in enumerate(ranked[:top_k], start=1)
         ]
+
+
+def _dense_scale(similarity: np.ndarray, fusion: str) -> np.ndarray:
+    """Put cosine similarities on BM25's [0, 1] scale; see FUSION_MODES in config."""
+    if fusion == "raw":
+        return (similarity + 1.0) / 2.0
+    if fusion == "minmax":
+        low = float(similarity.min())
+        spread = float(similarity.max()) - low
+        if spread <= 0.0:
+            # Every chunk is equally similar: dense carries no ranking signal.
+            return np.zeros_like(similarity)
+        return (similarity - low) / spread
+    raise ValueError(f"unknown fusion mode '{fusion}'; expected one of {', '.join(FUSION_MODES)}")
 
 
 def _path_indices(paths: list[str]) -> list[int]:

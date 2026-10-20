@@ -36,6 +36,9 @@ Per-variant honesty notes (repeated in REPORT.md):
 - hybrid-norerank: baseline-v0 with rerank_budget 0 (no coverage bonus).
 - hybrid-norecency: baseline-v0 with recency_weight 0 (quantifies how much
   the engineered mtimes contribute through the recency feature).
+- hybrid-v1: baseline-v0's weights with fusion "minmax" — dense similarities
+  rescaled per query to span [0, 1] like BM25, instead of v0's (cos+1)/2.
+  Isolates the fusion change; weights are not tuned (see bench.sweep).
 """
 from __future__ import annotations
 
@@ -178,6 +181,13 @@ class BlooRecallSystem:
             vector = self.embedder.embed_one(query)
         policy = dict(self.policy)
         policy["top_k"] = top_k
+        return self.search_with_vector(query, vector, policy)
+
+    def search_with_vector(
+        self, query: str, vector: Optional[List[float]], policy: Dict[str, Any]
+    ) -> List[str]:
+        """Rank with an already-embedded query under an explicit policy (bench.sweep)."""
+        assert self.index is not None
         rows = self.index.rank(query, vector, policy)
         results = []
         for row in rows:
@@ -224,6 +234,9 @@ def make_systems(config: Dict[str, Any], corpus_root: Path) -> Dict[str, Any]:
         "hybrid-norecency": BlooRecallSystem(
             resolved, "hybrid-norecency", policy_name="bench-norecency", embed_query=True,
             corpus_root=corpus_root,
+        ),
+        "hybrid-v1": BlooRecallSystem(
+            resolved, "hybrid-v1", policy_name="hybrid-v1", embed_query=True, corpus_root=corpus_root
         ),
     }
 

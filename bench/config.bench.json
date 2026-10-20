@@ -73,6 +73,15 @@
       "metadata_weight": 0.15,
       "rerank_budget": 20,
       "top_k": 10
+    },
+    "hybrid-v1": {
+      "policy_id": "hybrid-v1",
+      "fusion": "minmax",
+      "dense_weight": 0.55,
+      "recency_weight": 0.05,
+      "metadata_weight": 0.15,
+      "rerank_budget": 20,
+      "top_k": 10
     }
   },
   "active_policy": "baseline-v0",

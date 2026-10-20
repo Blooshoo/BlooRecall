@@ -273,6 +273,43 @@ class BlooRecallSystemTest(unittest.TestCase):
         ranked = system.search("sourdough hydration", top_k=2)
         self.assertEqual(ranked[0], "bench/corpus/b.md")
 
+    def test_hybrid_v1_ranks_the_right_file_first(self) -> None:
+        system = self.BlooRecallSystem(
+            self.config, "hybrid-v1", policy_name="hybrid-v1", embed_query=True
+        )
+        system.setup(fresh=True, embedder=FakeEmbedder())
+        self.assertEqual(system.policy["fusion"], "minmax")
+        ranked = system.search("how does the gateway retry a dropped connection", top_k=2)
+        self.assertEqual(ranked[0], "bench/corpus/a.md")
+
+    def test_sweep_scores_every_cell_from_one_embedding_pass(self) -> None:
+        from bench.sweep import format_table, sweep
+
+        class CountingEmbedder(FakeEmbedder):
+            calls = 0
+
+            def embed_one(self, text: str) -> list[float]:
+                CountingEmbedder.calls += 1
+                return super().embed_one(text)
+
+        # sweep() mirrors each root to corpus_root/<root name>, so labels carry that name.
+        prefix = f"bench/corpus/{self.corpus.name}"
+        queries = [
+            {"query": "gateway retry backoff", "graded": {f"{prefix}/a.md": 2}},
+            {"query": "sourdough hydration", "graded": {f"{prefix}/b.md": 2}},
+        ]
+        result = sweep(
+            self.config, queries, [0.5, 1.0], fresh=True, corpus_root=self.corpus.parent,
+            embedder=CountingEmbedder(),
+        )
+        self.assertEqual(CountingEmbedder.calls, len(queries))
+        self.assertEqual(
+            [(cell["fusion"], cell["dense_weight"]) for cell in result["cells"]],
+            [("raw", 0.5), ("raw", 1.0), ("minmax", 0.5), ("minmax", 1.0)],
+        )
+        self.assertTrue(all(cell["recall@5"] == 1.0 for cell in result["cells"]))
+        self.assertIn("| minmax | 1.00 |", format_table(result))
+
 
 if __name__ == "__main__":
     unittest.main()

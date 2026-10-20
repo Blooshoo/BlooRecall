@@ -24,6 +24,13 @@ REQUIRED_KEYS = (
 )
 POLICY_KEYS = ("dense_weight", "recency_weight", "metadata_weight", "rerank_budget", "top_k")
 
+# How dense similarities are put on BM25's scale before blending (optional policy key "fusion").
+# "raw" is the v0 mapping (cos+1)/2: it squeezes every chunk into a narrow band while BM25 is
+# max-normalized to span [0, 1], so BM25 dominates whatever dense_weight says. "minmax" rescales
+# the query's similarities to span [0, 1] too, so the weights mean what they say. A policy
+# without the key gets "raw", so baseline-v0 and its benchmark results stay reproducible.
+FUSION_MODES = ("raw", "minmax")
+
 
 def config_path(explicit: str | Path | None = None) -> Path:
     """Resolution order: explicit argument, BLOORECALL_CONFIG, project config.json."""
@@ -90,7 +97,16 @@ def default_config(roots: list[dict[str, Any]]) -> dict[str, Any]:
                 "metadata_weight": 0.15,
                 "rerank_budget": 20,
                 "top_k": 10,
-            }
+            },
+            "hybrid-v1": {
+                "policy_id": "hybrid-v1",
+                "fusion": "minmax",
+                "dense_weight": 0.55,
+                "recency_weight": 0.05,
+                "metadata_weight": 0.15,
+                "rerank_budget": 20,
+                "top_k": 10,
+            },
         },
         "active_policy": "baseline-v0",
         "search_defaults": {"top_k": 10, "max_top_k": 50, "snippet_chars": 240},
@@ -109,6 +125,11 @@ def _validate_policies(data: dict[str, Any], path: Path) -> None:
         missing = [key for key in POLICY_KEYS if key not in policy]
         if missing:
             raise RuntimeError(f"policy '{name}' in {path} is missing: {', '.join(missing)}")
+        fusion = policy.get("fusion", "raw")
+        if fusion not in FUSION_MODES:
+            raise RuntimeError(
+                f"policy '{name}' in {path} has fusion '{fusion}'; expected one of {', '.join(FUSION_MODES)}"
+            )
 
 
 def active_policy(config: dict[str, Any], override: str | None = None) -> dict[str, Any]:

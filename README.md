@@ -40,7 +40,7 @@ Requires Python 3.12+, `numpy`, the `mcp` SDK, and a running local Ollama with a
 git clone <this repo> && cd bloorecall
 pip install numpy mcp
 ollama pull qwen3-embedding:0.6b          # any Ollama embedding model works; set it in config
-python3 -m unittest discover -s tests     # 65 tests, no network needed
+python3 -m unittest discover -s tests     # 71 tests, no network needed
 ```
 
 Put `bin/` on your `PATH` for a short command, or run `./bin/bloorecall` in place.
@@ -97,7 +97,22 @@ claude mcp add bloorecall -- /abs/path/to/bloorecall/bin/bloorecall-mcp
 Against a one-pass grep baseline (what an agent gets from a single `rg` search) on a 251-file
 synthetic corpus, BlooRecall as shipped reaches **Recall@5 0.87 vs grep's 0.73** (MRR@10 0.77 vs
 0.58). In the same run, **embeddings alone did even better** (0.95 / 0.86), and grep was higher on
-queries whose answer sits under a heading (0.80 vs 0.70). Tuning the blend is the next step.
+queries whose answer sits under a heading (0.80 vs 0.70).
+
+The likely culprit is the blend's arithmetic, not its weights: v0 maps cosine similarity to
+`(cos+1)/2`, which packs every chunk into a narrow band, while BM25 is max-normalized to span
+[0, 1] — so a weak keyword hit outweighs a strong meaning match whatever `dense_weight` says.
+The `hybrid-v1` policy (`"fusion": "minmax"`) rescales dense similarities per query to [0, 1] as
+well. It is not the default yet because it has not been benchmarked against real embeddings;
+settle it on the dev split, then confirm once on test:
+
+```bash
+python3 -m bench.sweep                                # fusion × dense_weight grid, dev split only
+python3 -m bench.run --system hybrid-v1 --split test  # confirm the pick once
+```
+
+To try it on your own notes, copy the `hybrid-v1` block from `config.example.json` into your
+`config.json` policies and run `bloorecall search "..." --policy hybrid-v1`.
 
 ![Recall@5 by system](docs/benchmark.svg)
 
@@ -109,7 +124,7 @@ red-team review and one-command reproduction are in [`bench/REPORT.md`](bench/RE
 
 `config.json` (write a starter with `bloorecall init`). Key fields: `corpus_roots` (read-only
 folders with a `label` and `max_files`), `allowed_extensions`, `embedding` (Ollama model +
-endpoint), `policies` / `active_policy` (retrieval weights), `exclusions`, `search_defaults`. All
+endpoint), `policies` / `active_policy` (retrieval weights; `hybrid-v1` is the rescaled blend), `exclusions`, `search_defaults`. All
 paths are absolute; the index lives under the project's `var/`.
 
 ## Keeping it fresh
@@ -120,7 +135,7 @@ audit (exit 1 on drift).
 
 ## Status
 
-v1. 65 tests, all local. Born as a throwaway tool for personal knowledge-base research that turned
+v1. 71 tests, all local. Born as a throwaway tool for personal knowledge-base research that turned
 out to be genuinely useful, so it's shared in case it helps you too.
 
 ## License
