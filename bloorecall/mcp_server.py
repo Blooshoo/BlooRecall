@@ -20,6 +20,9 @@ the returned path if you need the whole document. The index covers local docs, p
 specs, notes and runbooks only; secrets, credential stores and private memory are
 excluded by design and credential-shaped queries are refused.
 
+`score` only orders the results of one search: it is not comparable across searches and is
+not a confidence, so judge a hit by its snippet and open the file when it matters.
+
 Each result carries a **trust verdict** (Heimdall-style disk verification):
 - **strong** — file on disk matches the indexed hash.
 - **rebuilt** — file matches disk and was re-indexed in the most recent refresh.

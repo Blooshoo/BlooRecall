@@ -497,6 +497,20 @@ class TestSearch(CorpusHarness):
         self.assertIn("websocket", snippet)
         self.assertLessEqual(len(snippet), 82)
 
+    def test_snippet_follows_rare_terms_not_the_first_common_word(self) -> None:
+        # Four common query words open the chunk; the two rare ones sit far below. Centring on
+        # the median first mention (v1.1) showed the opening and cut the answer off.
+        text = "how you get the " + "filler " * 60 + "kiln checkpoint costs 840 ms " + "filler " * 60
+        weights = {"how": 0.2, "you": 0.2, "get": 0.2, "the": 0.1, "kiln": 4.0, "checkpoint": 3.5}
+        snippet = snippet_for(text, "how do you get the kiln checkpoint", 120, weights)
+        self.assertIn("kiln checkpoint costs 840 ms", snippet)
+        self.assertLessEqual(len(snippet), 122)
+
+    def test_term_weights_rank_rare_words_above_common_ones(self) -> None:
+        self.refresh()
+        weights = self.engine().index.term_weights("the restic")
+        self.assertGreater(weights["restic"], weights["the"])
+
 
 class TestEmbedder(unittest.TestCase):
     def test_ollama_error_text_is_passed_on(self) -> None:

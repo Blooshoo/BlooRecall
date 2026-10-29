@@ -15,7 +15,7 @@ from . import store
 from .config import FUSION_MODES, active_policy, index_path
 from .embeddings import EmbeddingUnavailable, OllamaEmbedder
 from .trust import verify_path
-from .util import TOKENIZER_VERSION, tokens, utc_iso, words
+from .util import TOKEN_RE, TOKENIZER_VERSION, tokens, utc_iso, words
 
 # Only owner-local corpus material is searchable. The column is kept so a future
 # permission tier cannot silently become visible.
@@ -160,14 +160,21 @@ class BlooRecallIndex:
                 continue
             indices, frequencies = postings
             occurrences = query_terms.count(term)
-            df = int(indices.size)
-            idf = math.log(1.0 + (self.count - df + 0.5) / (df + 0.5))
+            idf = self._idf(int(indices.size))
             contribution = idf * frequencies * (BM25_K1 + 1) / (
                 frequencies + BM25_K1 * length_norm[indices]
             )
             scores[indices] += contribution * occurrences
             matched_terms[indices] += 1.0
         return scores, matched_terms
+
+    def _idf(self, df: int) -> float:
+        return math.log(1.0 + (self.count - df + 0.5) / (df + 0.5))
+
+    def term_weights(self, question: str) -> dict[str, float]:
+        """The query's terms weighted by rarity (BM25's IDF), for windowing snippets."""
+        return {term: self._idf(self.postings[term][0].size if term in self.postings else 0)
+                for term in set(tokens(question))}
 
     def rank(
         self,
@@ -354,24 +361,51 @@ def _fingerprint(path: Path) -> tuple[float, int]:
     return (stat.st_mtime, stat.st_size)
 
 
-def snippet_for(text: str, question: str, limit: int) -> str:
-    """Window the chunk around the densest run of query terms, then flatten it."""
+def snippet_for(
+    text: str, question: str, limit: int, weights: dict[str, float] | None = None
+) -> str:
+    """Flatten the chunk and window it on the stretch that holds the most query terms.
+
+    Each distinct term counts once per window, by its weight: the index's IDF, so a rare
+    "kiln" outweighs a "how" the query also contains (1.0 each without weights). The window
+    opens a little before its first hit and is trimmed to whole words.
+    """
     flat = WHITESPACE_RE.sub(" ", text).strip()
     if len(flat) <= limit:
         return flat
-    lowered = flat.casefold()
-    positions = [
-        lowered.find(term) for term in {token for token in tokens(question) if len(token) > 2}
-    ]
-    hits = sorted(position for position in positions if position >= 0)
+    wanted = {token for token in tokens(question) if len(token) > 2}
+    hits: list[tuple[int, str]] = []
+    for match in TOKEN_RE.finditer(flat):
+        term = match.group().casefold()
+        if term in wanted:
+            hits.append((match.start(), term))
     if not hits:
         return flat[:limit].rstrip() + "…"
-    centre = hits[len(hits) // 2]
-    start = max(0, centre - limit // 3)
-    window = flat[start : start + limit].strip()
+    weight = (weights or {}).get
+    span = limit * 3 // 4  # the hits must fit here; the rest of the window is lead-in
+    best, best_score, right = 0, -1.0, 0
+    inside: Counter[str] = Counter()
+    for left, (position, term) in enumerate(hits):
+        while right < len(hits) and hits[right][0] < position + span:
+            inside[hits[right][1]] += 1
+            right += 1
+        score = sum(weight(name, 1.0) for name in inside)
+        if score > best_score:
+            best, best_score = left, score
+        inside[term] -= 1
+        if not inside[term]:
+            del inside[term]
+    anchor = hits[best][0]
+    start = max(0, min(anchor - (limit - span), len(flat) - limit))
+    if start:
+        boundary = flat.find(" ", start, anchor)
+        start = boundary + 1 if boundary >= 0 else start
+    window = flat[start : start + limit]
+    if start + limit < len(flat) and " " in window:
+        window = window[: window.rfind(" ")]
     prefix = "…" if start > 0 else ""
-    suffix = "…" if start + limit < len(flat) else ""
-    return f"{prefix}{window}{suffix}"
+    suffix = "…" if start + len(window) < len(flat) else ""
+    return f"{prefix}{window.strip()}{suffix}"
 
 
 class SearchEngine:
@@ -444,9 +478,10 @@ class SearchEngine:
         results = index.rank(question, vector, policy, project=project)[:limit]
 
         snippet_chars = int(defaults.get("snippet_chars", 240))
+        weights = index.term_weights(question)
         for rank, row in enumerate(results, start=1):
             row["rank"] = rank
-            row["snippet"] = snippet_for(row.pop("text"), question, snippet_chars)
+            row["snippet"] = snippet_for(row.pop("text"), question, snippet_chars, weights)
         # Heimdall-style per-hit disk verification: stat + re-hash before the
         # agent sees the result. Adds two file reads per top hit — cheap on a
         # local box, worth the staleness guarantee.
