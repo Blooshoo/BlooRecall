@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,13 @@ def _print(message: str = "") -> None:
 def _relative_home(path: str) -> str:
     home = str(Path.home())
     return path.replace(home, "~", 1) if path.startswith(home) else path
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {number}")
+    return number
 
 
 def _verdict_marker(trust: dict[str, Any] | None) -> str:
@@ -66,21 +75,26 @@ def command_search(args: argparse.Namespace) -> int:
             query=args.query, top_k=args.top_k, policy_name=args.policy, project=args.project
         )
     except PrivateQueryRefused as error:
-        print(f"refused: {error}", file=sys.stderr)
+        if args.json:
+            refusal = {"query": args.query, "refused": True, "reason": str(error), "results": []}
+            print(json.dumps(refusal, indent=2, ensure_ascii=False))
+        else:
+            print(f"refused: {error}", file=sys.stderr)
         return 2
     if args.json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
     results = payload["results"]
-    keyword_note = (
-        f"note: keyword-only results ({payload.get('warning', '')})"
-        if payload.get("retrieval") == "keyword-only"
-        else ""
-    )
+    notes = []
+    if payload.get("warning"):
+        kind = "keyword-only results: " if payload.get("retrieval") == "keyword-only" else ""
+        notes.append(f"note: {kind}{payload['warning']}")
+    if args.top_k and args.top_k > payload["top_k"]:
+        notes.append(f"note: -k capped at {payload['top_k']} (search_defaults.max_top_k)")
     if not results:
         _print(f"no matches for {payload['query']!r}")
-        if keyword_note:
-            _print(keyword_note)
+        for note in notes:
+            _print(note)
         return 1
     for row in results:
         print(f"{row['rank']:>2}. {row['score']:.4f}  {_relative_home(row['path'])}")
@@ -98,8 +112,8 @@ def command_search(args: argparse.Namespace) -> int:
         f"{index['source_count']} files / {index['chunk_count']} chunks · "
         f"index refreshed {index['refreshed_at_iso'][:19]}Z"
     )
-    if keyword_note:
-        _print(keyword_note)
+    for note in notes:
+        _print(note)
     return 0
 
 
@@ -126,6 +140,14 @@ def command_refresh(args: argparse.Namespace) -> int:
     print(f"  manifest sha256: {summary['manifest_sha256']}")
     if summary["missing_roots"]:
         print(f"  WARNING missing roots: {', '.join(summary['missing_roots'])}")
+    for root in summary["over_budget"]:
+        print(
+            f"  WARNING {root['label']} holds {root['files']} indexable files over its max_files of "
+            f"{root['max_files']}; the oldest were left out"
+        )
+    if summary["rejected_count"]:
+        rejections = Path(summary["manifest_path"]).with_name("rejections.jsonl")
+        print(f"  skipped: {summary['rejected_count']} files (reasons in {rejections})")
     return 0
 
 
@@ -156,7 +178,7 @@ def command_status(args: argparse.Namespace) -> int:
         payload["refreshed_at_iso"] = utc_iso(float(metadata.get("refreshed_at", 0) or 0))
     if args.json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
-        return 0
+        return 0 if payload["index_exists"] else 1
     print(f"config      {payload['config_path']}")
     print(f"index       {payload['index_path']}")
     print(f"policy      {payload['active_policy']}")
@@ -265,7 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     search = subparsers.add_parser("search", help="find files matching a natural-language query")
     search.add_argument("query", help="what you are looking for")
-    search.add_argument("-k", "--top-k", type=int, help="number of files to return")
+    search.add_argument("-k", "--top-k", type=_positive_int, help="number of files to return")
     search.add_argument("-p", "--project", help="only return files whose project label contains this")
     search.add_argument("--policy", help="named retrieval policy from config.json")
     search.add_argument("--json", action="store_true", help="emit JSON")
@@ -293,9 +315,11 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.set_defaults(func=command_doctor)
 
     verify = subparsers.add_parser(
-        "verify", help="read-only drift audit: re-hash sources vs disk, exit 1 on drift"
+        "verify", help="read-only drift audit: compare sources with disk, exit 1 on drift"
     )
-    verify.add_argument("--deep", action="store_true", help="re-hash every source even if mtime/size match")
+    verify.add_argument(
+        "--deep", action="store_true", help="re-hash every source (default: compare size and mtime)"
+    )
     verify.add_argument("--json", action="store_true", help="emit JSON summary")
     verify.set_defaults(func=lambda args: _command_verify(args))
     return parser
@@ -313,10 +337,29 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        return int(args.func(args))
+        code = int(args.func(args))
+        sys.stdout.flush()  # meet a closed pipe here rather than in the interpreter's exit flush
+        return code
     except (RuntimeError, ValueError) as error:
         print(f"bloorecall: {error}", file=sys.stderr)
         return 3
+    except sqlite3.OperationalError as error:
+        print(f"bloorecall: the index is busy or unavailable ({error})", file=sys.stderr)
+        return 3
+    except sqlite3.DatabaseError as error:
+        print(
+            f"bloorecall: the index is unreadable ({error}); rebuild it with 'bloorecall refresh --full'",
+            file=sys.stderr,
+        )
+        return 3
+    except KeyboardInterrupt:
+        print("bloorecall: interrupted", file=sys.stderr)
+        return 130
+    except BrokenPipeError:
+        # The reader went away (`| head`): stop quietly, pointing stdout at devnull so the
+        # interpreter's final flush cannot raise again.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 1
 
 
 if __name__ == "__main__":

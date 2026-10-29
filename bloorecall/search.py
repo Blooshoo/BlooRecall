@@ -13,6 +13,7 @@ import numpy as np
 
 from . import store
 from .config import FUSION_MODES, active_policy, index_path
+from .corpus import secret_reason
 from .embeddings import EmbeddingUnavailable, OllamaEmbedder
 from .trust import verify_path
 from .util import TOKEN_RE, TOKENIZER_VERSION, tokens, utc_iso, words
@@ -68,7 +69,8 @@ def private_query_reason(question: str) -> str | None:
     for marker in sorted(PRIVATE_QUERY_MARKERS):
         if marker in lowered:
             return marker
-    return None
+    # A pasted key or token: the same shapes that keep a file out of the index.
+    return secret_reason(question)
 
 
 class BlooRecallIndex:
@@ -90,6 +92,7 @@ class BlooRecallIndex:
         self.texts = [row[4] for row in rows]
         self.mtimes = np.array([float(row[8]) for row in rows], dtype=np.float64)
         self.projects = [row[9] for row in rows]
+        self.project_labels = sorted(set(self.projects))
         self.file_types = [row[11] for row in rows]
         self.indexed_ats = [float(row[13]) for row in rows]
 
@@ -502,6 +505,10 @@ class SearchEngine:
         vector, warning = self._query_vector(index, question)
         retrieval = "keyword-only" if vector is None else "hybrid"
         results = index.rank(question, vector, policy, project=project)[:limit]
+        if project and not any(project.casefold() in label.casefold() for label in index.project_labels):
+            labels = ", ".join(index.project_labels[:12]) + (", …" if len(index.project_labels) > 12 else "")
+            unmatched = f"no project label contains '{project}' (labels: {labels})"
+            warning = f"{warning}; {unmatched}" if warning else unmatched
 
         snippet_chars = int(defaults.get("snippet_chars", 240))
         weights = index.term_weights(question)

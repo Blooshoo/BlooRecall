@@ -156,6 +156,14 @@ next `bloorecall refresh` rewrites it on disk without re-embedding (its summary 
 - Shallow `verify` compares each file's size and mtime with the index (it used to check only
   that files exist), and files that refresh refuses on content (secret-shaped, not UTF-8,
   blank) no longer count as unindexed drift.
+- `refresh` re-chunks every file on its own when `chunk_chars`, `chunk_overlap_chars` or
+  `parse_version` change (they used to need `--full`), logs every file it skips with a reason in
+  `rejections.jsonl` next to the index, warns when a root holds more files than its `max_files`,
+  refuses to run twice at once on one index, and keeps the index files owner-only (mode 600).
+- Config: `chunk_chars` and `chunk_overlap_chars` are required (refresh failed without them
+  anyway), the overlap must be shorter than the chunk, and `corpus_roots` may not be empty.
+- A query holding a pasted key or token is refused like a credential-phrased one, and
+  `search --json` prints a refusal as JSON.
 
 ## Keeping it fresh
 

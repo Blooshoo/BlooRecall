@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import os
 import time
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+
+try:
+    import fcntl
+except ImportError:  # not POSIX: refreshes of one index are not serialised
+    fcntl = None
 
 from . import store
 from .config import index_path, manifest_path
@@ -29,6 +36,8 @@ from .util import (
 )
 
 Progress = Callable[[str], None]
+# A change to any of these re-chunks every file on the next refresh (no --full needed).
+CHUNK_SETTINGS = ("chunk_chars", "chunk_overlap_chars", "parse_version")
 
 
 def _noop(_message: str) -> None:
@@ -93,6 +102,22 @@ class EmbeddingPool:
         return blobs
 
 
+@contextmanager
+def _refresh_lock(target: Path) -> Iterator[None]:
+    """One refresh per index at a time: a second fails fast instead of racing the first."""
+    lock_path = ensure_write_target(target.with_name(f"{target.name}.lock"))
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w") as handle:
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError(
+                    f"another refresh of {target} is running; try again once it finishes"
+                ) from None
+        yield
+
+
 def refresh(
     config: dict[str, Any],
     *,
@@ -100,9 +125,21 @@ def refresh(
     progress: Progress | None = None,
     embedder: OllamaEmbedder | None = None,
 ) -> dict[str, Any]:
-    say = progress or _noop
     target = index_path(config)
     ensure_write_target(target)
+    with _refresh_lock(target):
+        return _refresh(config, target, full=full, progress=progress, embedder=embedder)
+
+
+def _refresh(
+    config: dict[str, Any],
+    target: Path,
+    *,
+    full: bool,
+    progress: Progress | None,
+    embedder: OllamaEmbedder | None,
+) -> dict[str, Any]:
+    say = progress or _noop
     if full and target.exists():
         for suffix in ("", "-wal", "-shm"):
             candidate = Path(f"{target}{suffix}")
@@ -122,11 +159,21 @@ def refresh(
                 "rerun with --full to rebuild"
             )
 
+        changed = [key for key in CHUNK_SETTINGS if metadata.get(key) not in (None, str(config[key]))]
+        rechunk = full or bool(changed)
+        if changed and not full:
+            say(f"{', '.join(changed)} changed since the last refresh: re-chunking every file")
+
         say("walking corpus roots")
         walk = walk_corpus(config)
-        say(f"{len(walk.sources)} candidate files, {len(walk.rejections)} rejected by gates")
+        say(f"{len(walk.sources)} candidate files, {len(walk.rejections)} skipped by gates or budgets")
         if walk.missing_roots:
             say(f"WARNING missing corpus roots (skipping deletions there): {', '.join(walk.missing_roots)}")
+        for root in walk.over_budget:
+            say(
+                f"WARNING {root['label']} holds {root['files']} indexable files but max_files is "
+                f"{root['max_files']}: indexing the newest {root['max_files']}"
+            )
 
         known = store.load_sources(connection)
         seen: set[str] = set()
@@ -166,7 +213,7 @@ def refresh(
             previous = known.get(canonical)
             if (
                 previous
-                and not full
+                and not rechunk
                 and previous.byte_count == source.size
                 and abs(previous.mtime - source.mtime) < 1e-6
             ):
@@ -178,6 +225,7 @@ def refresh(
             payload = read_source(source.path)
             if payload is None:
                 stats["unreadable"] += 1
+                walk.rejections.append({"path": canonical, "reason": "unreadable or not UTF-8"})
                 if previous:
                     store.delete_source(connection, canonical)
                     stats["removed"] += 1
@@ -192,7 +240,7 @@ def refresh(
                     stats["removed"] += 1
                 continue
             content_hash = sha256_bytes(data)
-            if previous and previous.content_hash == content_hash and not full:
+            if previous and previous.content_hash == content_hash and not rechunk:
                 store.touch_source(connection, canonical, source.mtime, started)
                 if previous.project != source.project or previous.root_label != source.root_label:
                     store.update_source_labels(connection, canonical, source.project, source.root_label)
@@ -217,6 +265,7 @@ def refresh(
             )
             if not pieces:
                 stats["empty_after_chunking"] += 1
+                walk.rejections.append({"path": canonical, "reason": "no text to index"})
                 if previous:
                     store.delete_source(connection, canonical)
                     stats["removed"] += 1
@@ -260,12 +309,15 @@ def refresh(
             store.replace_chunks(connection, canonical, rows)
             store.upsert_source(connection, staged_sources[canonical])
 
-        # A file under a root that is missing right now (an unmounted drive) is kept until the
-        # root comes back. One under no configured root at all (the root was dropped from the
-        # config) goes, like a file deleted from a root that is still there.
+        # A file under a root that is missing right now (an unmounted drive, or a path edited to
+        # one that is not there yet: matched by label too) is kept until the root comes back.
+        # One under no configured root at all (the root was dropped from the config) goes, like
+        # a file deleted from a root that is still there.
         missing = tuple(str(Path(root).resolve()) for root in walk.missing_roots)
         for canonical in sorted(set(known) - seen):
-            if any(canonical == root or canonical.startswith(f"{root}/") for root in missing):
+            if known[canonical].root_label in walk.missing_labels or any(
+                canonical == root or canonical.startswith(f"{root}/") for root in missing
+            ):
                 stats["orphan_kept"] += 1
                 continue
             store.delete_source(connection, canonical)
@@ -316,6 +368,7 @@ def refresh(
         "chunks_reused_from_cache": pool.reused,
         "rejected_count": len(walk.rejections),
         "missing_roots": walk.missing_roots,
+        "over_budget": walk.over_budget,
         "elapsed_seconds": round(time.time() - started, 3),
         **{key: int(value) for key, value in sorted(stats.items())},
     }
@@ -350,6 +403,7 @@ def _write_manifest(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(stable_json(row) + "\n")
+    os.chmod(path, 0o600)
 
 
 def _write_rejections(path: Path, rows: list[dict[str, str]]) -> None:
@@ -358,3 +412,4 @@ def _write_rejections(path: Path, rows: list[dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in sorted(rows, key=lambda item: (item["reason"], item["path"])):
             handle.write(stable_json(row) + "\n")
+    os.chmod(path, 0o600)

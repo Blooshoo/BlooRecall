@@ -176,6 +176,32 @@ class TestExclusions(CorpusHarness):
         self.assertIsNotNone(secret_reason("-----BEGIN OPENSSH PRIVATE KEY-----"))
         self.assertIsNone(secret_reason("this document merely mentions keys"))
 
+    def test_a_file_name_that_is_not_utf8_is_skipped_not_fatal(self) -> None:
+        with open(os.path.join(os.fsencode(self.corpus), b"bad-\xff.md"), "wb") as handle:
+            handle.write(b"# Bad name\n\nthe content is fine\n")
+        summary = self.refresh()
+        self.assertEqual(summary["source_count"], 3)
+        rejections = manifest_path(self.config).with_name("rejections.jsonl").read_text(encoding="utf-8")
+        self.assertIn("file name is not valid UTF-8", rejections)
+
+    def test_every_skipped_file_is_logged_with_its_reason(self) -> None:
+        (self.corpus / "docs" / "latin1.md").write_bytes("caf\xe9 notes\n".encode("latin-1"))
+        write(self.corpus / "docs" / "blank.md", "\n   \n")
+        write(self.corpus / "docs" / "zero.md", "")
+        self.refresh()
+        rows = manifest_path(self.config).with_name("rejections.jsonl").read_text(encoding="utf-8")
+        reasons = {json.loads(line)["reason"] for line in rows.splitlines()}
+        self.assertTrue({"unreadable or not UTF-8", "no text to index", "empty file"} <= reasons)
+
+    def test_a_root_over_its_file_budget_is_reported(self) -> None:
+        self.config["corpus_roots"][0]["max_files"] = 2
+        summary = self.refresh()
+        self.assertEqual(summary["source_count"], 2)
+        self.assertEqual(
+            [(root["label"], root["files"], root["max_files"]) for root in summary["over_budget"]],
+            [("testcorpus", 3, 2)],
+        )
+
     def test_writes_outside_the_project_are_refused(self) -> None:
         with self.assertRaises(ValueError):
             ensure_write_target(Path("/tmp/bloorecall-escape.sqlite3"))
@@ -336,6 +362,39 @@ class TestRefresh(CorpusHarness):
         self.assertIn('"jitter"', stored)
         self.assertNotIn('"jitter."', stored)
 
+    def test_a_root_edited_to_a_missing_path_keeps_its_files(self) -> None:
+        self.refresh()
+        self.config["corpus_roots"][0]["path"] = "/nonexistent/bloorecall-moved"
+        summary = self.refresh()
+        self.assertEqual(summary["removed"], 0)
+        self.assertEqual(summary["source_count"], 3)
+
+    def test_changing_chunk_settings_rechunks_without_full(self) -> None:
+        first = self.refresh()
+        self.config["chunk_chars"] = 120
+        self.config["chunk_overlap_chars"] = 20
+        second = self.refresh()
+        self.assertEqual(second["reindexed"], 3)
+        self.assertGreater(second["chunk_count"], first["chunk_count"])
+        self.assertEqual(self.refresh()["unchanged"], 3)
+
+    def test_a_second_refresh_of_the_same_index_fails_fast(self) -> None:
+        import fcntl
+
+        target = index_path(self.config)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target.with_name(f"{target.name}.lock"), "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(RuntimeError, "another refresh"):
+                self.refresh()
+        self.assertEqual(self.refresh()["added"], 3)
+
+    def test_index_files_are_private_to_the_owner(self) -> None:
+        self.refresh()
+        target = index_path(self.config)
+        for path in (target, manifest_path(self.config), target.with_name("rejections.jsonl")):
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600, path)
+
     def test_a_root_dropped_from_the_config_takes_its_files_with_it(self) -> None:
         other = Path(tempfile.mkdtemp(prefix="bloorecall-other-"))
         self.addCleanup(shutil.rmtree, other, True)
@@ -404,6 +463,16 @@ class TestSearch(CorpusHarness):
         self.refresh()
         with self.assertRaises(PrivateQueryRefused):
             self.engine().search("where is the discord api key")
+        for pasted in ("AKIA1234567890ABCDEF", "sk-proj-abcdefghijklmnopqrstuvwxyz0123"):
+            with self.assertRaises(PrivateQueryRefused):
+                self.engine().search(f"which note has {pasted}")
+
+    def test_a_project_filter_that_matches_no_label_says_so(self) -> None:
+        self.refresh()
+        payload = self.engine().search("retry", project="kitchen")
+        self.assertEqual(payload["results"], [])
+        self.assertIn("no project label contains 'kitchen'", payload["warning"])
+        self.assertIn("testcorpus/docs", payload["warning"])
 
     def test_index_reloads_after_a_refresh(self) -> None:
         self.refresh()
@@ -519,6 +588,69 @@ class TestSearch(CorpusHarness):
         self.assertGreater(weights["restic"], weights["the"])
 
 
+class TestCli(CorpusHarness):
+    """The command line's edges: exit codes, refusals, broken indexes and pipes."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # Nothing listens on port 9, so searches run keyword-only, with or without Ollama.
+        self.config["embedding"]["endpoint"] = "http://127.0.0.1:9/api/embed"
+        self.config_file = self.index_dir / "config.json"
+        self.config_file.write_text(json.dumps(self.config), encoding="utf-8")
+
+    def cli(self, *argv: str) -> tuple[int, str, str]:
+        from contextlib import redirect_stderr, redirect_stdout
+
+        from bloorecall.cli import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                code = main(["--config", str(self.config_file), *argv])
+            except SystemExit as stop:  # argparse rejecting the arguments
+                code = int(stop.code)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_top_k_must_be_positive(self) -> None:
+        self.assertEqual(self.cli("search", "retry", "-k", "0")[0], 2)
+
+    def test_a_refusal_is_still_json_under_json(self) -> None:
+        self.refresh()
+        code, out, _ = self.cli("search", "--json", "the api key for the gateway")
+        self.assertEqual(code, 2)
+        self.assertTrue(json.loads(out)["refused"])
+
+    def test_status_json_exits_1_without_an_index(self) -> None:
+        code, out, _ = self.cli("status", "--json")
+        self.assertEqual(code, 1)
+        self.assertFalse(json.loads(out)["index_exists"])
+
+    def test_a_corrupt_index_is_a_message_not_a_traceback(self) -> None:
+        target = index_path(self.config)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(os.urandom(4096))
+        code, _, err = self.cli("status")
+        self.assertEqual(code, 3)
+        self.assertIn("refresh --full", err)
+
+    def test_ctrl_c_is_a_message_not_a_traceback(self) -> None:
+        with mock.patch("bloorecall.cli.command_status", side_effect=KeyboardInterrupt):
+            code, _, err = self.cli("status")
+        self.assertEqual((code, err.strip()), (130, "bloorecall: interrupted"))
+
+    def test_a_closed_pipe_ends_quietly(self) -> None:
+        from bloorecall.cli import main
+
+        self.refresh()
+        read_end, write_end = os.pipe()
+        os.close(read_end)  # the reader (`| head`) has already gone
+        pipe = io.TextIOWrapper(io.FileIO(write_end, "w"))
+        with mock.patch.object(sys, "stdout", pipe):
+            code = main(["--config", str(self.config_file), "status", "--json"])
+        self.assertEqual(code, 1)
+        pipe.close()
+
+
 class TestEmbedder(unittest.TestCase):
     def test_ollama_error_text_is_passed_on(self) -> None:
         body = io.BytesIO(b'{"error":"model \\"nomic\\" not found, try pulling it first"}')
@@ -593,6 +725,20 @@ class TestConfig(unittest.TestCase):
         self.addCleanup(os.unlink, path)
         with self.assertRaises(RuntimeError):
             load_config(path)
+
+    def test_impossible_corpus_settings_are_rejected(self) -> None:
+        base = json.loads((PROJECT_ROOT / "config.example.json").read_text(encoding="utf-8"))
+        broken = {
+            "no roots": {"corpus_roots": []},
+            "overlap as long as the chunk": {"chunk_overlap_chars": base["chunk_chars"]},
+            "no file may be indexed": {"max_file_bytes": 0},
+        }
+        for name, change in broken.items():
+            with self.subTest(name), tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+                json.dump({**base, **change}, handle)
+            self.addCleanup(os.unlink, handle.name)
+            with self.subTest(name), self.assertRaises(RuntimeError):
+                load_config(handle.name)
 
     def test_unknown_fusion_is_rejected(self) -> None:
         config = json.loads((PROJECT_ROOT / "config.example.json").read_text(encoding="utf-8"))

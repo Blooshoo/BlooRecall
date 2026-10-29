@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from array import array
@@ -90,6 +91,11 @@ def connect_write(path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.executescript(SCHEMA)
     connection.commit()
+    # The index holds the text of every note it covers: owner-only, whatever the umask. SQLite
+    # creates -wal and -shm with the database file's mode; older ones are fixed here too.
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        if candidate.exists():
+            os.chmod(candidate, 0o600)
     return connection
 
 
