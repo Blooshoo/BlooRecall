@@ -10,14 +10,18 @@ from typing import Any, Iterator
 from .util import PROJECT_ROOT, sha256_bytes
 
 # Secret shapes inherited from the v0 lab. A file matching any of these is never
-# indexed, even if it survived the path and filename gates.
+# indexed, even if it survived the path and filename gates, and a query holding one is refused.
 SECRET_PATTERNS = [
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"\b(?:sk|ghp|github_pat)_[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"),
-    re.compile(
-        r"(?im)^\s*(?:api[_-]?key|access[_-]?token|client[_-]?secret)\s*[=:]\s*['\"]?[A-Za-z0-9_./+-]{20,}"
+    ("private key block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("AWS access key id", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    # sk- as well as sk_: OpenAI-style keys use the hyphen.
+    ("API token", re.compile(r"\b(?:sk|ghp|github_pat)[_-][A-Za-z0-9_-]{20,}\b")),
+    ("Slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{20,}\b")),
+    (
+        "key or token assignment",
+        re.compile(
+            r"(?im)^\s*(?:api[_-]?key|access[_-]?token|client[_-]?secret)\s*[=:]\s*['\"]?[A-Za-z0-9_./+-]{20,}"
+        ),
     ),
 ]
 
@@ -39,6 +43,14 @@ class WalkResult:
     rejections: list[dict[str, str]]
     missing_roots: list[str]
     covered_roots: list[str]
+    missing_labels: list[str]
+    # Roots holding more indexable files than their max_files: {root, label, files, max_files}.
+    over_budget: list[dict[str, Any]]
+
+
+def printable(path: Path) -> str:
+    """A path as text that survives JSON and SQLite, even when its name is not valid UTF-8."""
+    return str(path).encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 class Exclusions:
@@ -58,6 +70,10 @@ class Exclusions:
         # about genuine safety decisions rather than source files we never wanted.
         if path.suffix.casefold() not in self.allowed_extensions:
             return "extension not allowlisted"
+        try:
+            str(path).encode("utf-8")
+        except UnicodeEncodeError:
+            return "file name is not valid UTF-8"
         denied = {part.casefold() for part in path.parts} & self.path_parts
         if denied:
             return f"denied path segment: {sorted(denied)[0]}"
@@ -100,7 +116,7 @@ def _walk_root(
                     if pruned is not None and not name.startswith("."):
                         pruned.append(
                             {
-                                "path": str(current_path / name),
+                                "path": printable(current_path / name),
                                 "reason": f"denied path segment: {name.casefold()}",
                             }
                         )
@@ -130,12 +146,15 @@ def walk_corpus(config: dict[str, Any]) -> WalkResult:
     rejections: list[dict[str, str]] = []
     missing_roots: list[str] = []
     covered_roots: list[str] = []
+    missing_labels: list[str] = []
+    over_budget: list[dict[str, Any]] = []
     seen: set[Path] = set()
     for entry in config["corpus_roots"]:
         root = Path(entry["path"]).expanduser()
         label = entry.get("label") or root.name
         if not root.exists():
             missing_roots.append(str(root))
+            missing_labels.append(label)
             continue
         covered_roots.append(str(root.resolve()))
         accepted: list[SourceFile] = []
@@ -143,15 +162,18 @@ def walk_corpus(config: dict[str, Any]) -> WalkResult:
             reason = exclusions.reject_reason(path)
             if reason:
                 if reason != "extension not allowlisted":
-                    rejections.append({"path": str(path), "reason": reason})
+                    rejections.append({"path": printable(path), "reason": reason})
                 continue
             try:
                 stat = path.stat()
             except OSError:
                 rejections.append({"path": str(path), "reason": "unreadable metadata"})
                 continue
-            if stat.st_size == 0 or stat.st_size > exclusions.max_file_bytes:
-                rejections.append({"path": str(path), "reason": "empty or over size limit"})
+            if stat.st_size == 0:
+                rejections.append({"path": str(path), "reason": "empty file"})
+                continue
+            if stat.st_size > exclusions.max_file_bytes:
+                rejections.append({"path": str(path), "reason": "over max_file_bytes"})
                 continue
             resolved = path.resolve()
             if resolved in seen:
@@ -169,6 +191,7 @@ def walk_corpus(config: dict[str, Any]) -> WalkResult:
         limit = int(entry.get("max_files", 0) or 0)
         if limit and len(accepted) > limit:
             # Keep the freshest files when a root exceeds its budget.
+            over_budget.append({"root": str(root), "label": label, "files": len(accepted), "max_files": limit})
             accepted.sort(key=lambda item: (-item.mtime, str(item.path)))
             for dropped in accepted[limit:]:
                 rejections.append({"path": str(dropped.path), "reason": "over root max_files budget"})
@@ -181,13 +204,15 @@ def walk_corpus(config: dict[str, Any]) -> WalkResult:
         rejections=rejections,
         missing_roots=sorted(missing_roots),
         covered_roots=sorted(covered_roots),
+        missing_labels=sorted(missing_labels),
+        over_budget=over_budget,
     )
 
 
 def secret_reason(text: str) -> str | None:
-    for index, pattern in enumerate(SECRET_PATTERNS, start=1):
+    for name, pattern in SECRET_PATTERNS:
         if pattern.search(text):
-            return f"high-confidence secret pattern {index}"
+            return f"secret-shaped: {name}"
     return None
 
 

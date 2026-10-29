@@ -13,9 +13,10 @@ LOG_DIR="${PROJECT_ROOT}/var/verify-logs"
 mkdir -p "${LOG_DIR}"
 LOG_FILE="${LOG_DIR}/verify-$(date -u +%Y%m%dT%H%M%SZ).json"
 
-# Run the audit in deep mode; capture exit code without killing the script.
-python3 "${PROJECT_ROOT}/scripts/bloorecall-verify-drift.py" --json > "${LOG_FILE}" 2>&1
-EXIT_CODE=$?
+# Run the audit in deep mode; capture exit code without killing the script (under set -e a
+# bare non-zero exit, i.e. any drift, would end it before the log is echoed or pruned).
+EXIT_CODE=0
+python3 "${PROJECT_ROOT}/scripts/bloorecall-verify-drift.py" --json > "${LOG_FILE}" 2>&1 || EXIT_CODE=$?
 
 cat "${LOG_FILE}"
 

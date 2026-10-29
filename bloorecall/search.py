@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import threading
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -11,9 +13,10 @@ import numpy as np
 
 from . import store
 from .config import FUSION_MODES, active_policy, index_path
+from .corpus import secret_reason
 from .embeddings import EmbeddingUnavailable, OllamaEmbedder
-from .trust import TrustVerdict, verify_path
-from .util import tokens, utc_iso
+from .trust import verify_path
+from .util import TOKEN_RE, TOKENIZER_VERSION, tokens, utc_iso, words
 
 # Only owner-local corpus material is searchable. The column is kept so a future
 # permission tier cannot silently become visible.
@@ -31,6 +34,19 @@ PRIVATE_QUERY_MARKERS = {
     "personal memory",
 }
 
+# Function words are dropped from the query before BM25 (the index keeps every term). BM25's IDF
+# makes them light, but rank fusion only sees ranks: a chunk sharing nothing but "the" with the
+# query still earns a keyword rank, a short chunk a high one, so on short notes these words
+# decided the order (v1.1). Same list as the frozen grep baseline's; a query of nothing but
+# function words keeps them all.
+STOPWORDS = frozenset(
+    """a about after all also an and any are as at be because been before being both but by came can
+could did do does done for from get gets got had has have he her here hers him his how i if in into is
+it its just like made make many may me might more most much must my never no nor not now of off on one
+only or other our out over own said same see she should since so some such than that the their them
+then there these they this those through to too under until up use used using very was way we well
+were what when where which while who why will with within without would you your""".split()
+)
 BM25_K1 = 1.5
 BM25_B = 0.75
 COVERAGE_BONUS = 0.18
@@ -42,12 +58,19 @@ class PrivateQueryRefused(RuntimeError):
     """Raised when a query asks for material BlooRecall will not surface."""
 
 
+def keyword_terms(question: str) -> list[str]:
+    """The query's BM25 terms: its tokens minus function words (all of them if that is all)."""
+    terms = tokens(question)
+    return [term for term in terms if term not in STOPWORDS] or terms
+
+
 def private_query_reason(question: str) -> str | None:
     lowered = question.casefold()
     for marker in sorted(PRIVATE_QUERY_MARKERS):
         if marker in lowered:
             return marker
-    return None
+    # A pasted key or token: the same shapes that keep a file out of the index.
+    return secret_reason(question)
 
 
 class BlooRecallIndex:
@@ -59,8 +82,6 @@ class BlooRecallIndex:
         try:
             self.metadata = store.read_metadata(connection)
             rows = store.load_search_rows(connection, ALLOWED_PERMISSIONS)
-            model = self.metadata.get("embedding_model", "")
-            self._cached_text_hashes: set[str] = store.cached_text_hashes(connection, model)
         finally:
             connection.close()
         self.fingerprint = _fingerprint(path)
@@ -69,25 +90,29 @@ class BlooRecallIndex:
         self.ordinals = [int(row[2]) for row in rows]
         self.content_hashes = [row[3] for row in rows]
         self.texts = [row[4] for row in rows]
-        self.token_counts = np.array([float(row[5]) for row in rows], dtype=np.float32)
         self.mtimes = np.array([float(row[8]) for row in rows], dtype=np.float64)
         self.projects = [row[9] for row in rows]
+        self.project_labels = sorted(set(self.projects))
         self.file_types = [row[11] for row in rows]
-        self.text_hashes = [row[12] for row in rows]
         self.indexed_ats = [float(row[13]) for row in rows]
 
-        # Path-level lookups for trust verification: every chunk of a file shares
-        # the same content_hash / indexed_at, so we key on path.
-        self._path_text_hashes: dict[str, list[str]] = {}
-        for path_value, text_hash in zip(self.paths, self.text_hashes):
-            self._path_text_hashes.setdefault(path_value, []).append(text_hash)
+        # Term counts are stored per chunk at index time. An index written by an older tokenizer
+        # is re-tokenized from its chunk text here, so search is right before the next refresh
+        # (which rewrites the stored counts, without re-embedding anything).
+        if self.metadata.get("tokenizer_version") == TOKENIZER_VERSION:
+            term_counts = [json.loads(row[6]) for row in rows]
+        else:
+            term_counts = [Counter(tokens(text)) for text in self.texts]
+        self.token_counts = np.array(
+            [float(sum(counts.values())) for counts in term_counts], dtype=np.float32
+        )
 
         self.count = len(rows)
         # Postings are held as numpy pairs: a Python list of tuples for a corpus this
         # size costs hundreds of megabytes, two arrays per term costs tens.
         raw_postings: dict[str, tuple[list[int], list[float]]] = {}
-        for index, row in enumerate(rows):
-            for term, frequency in json.loads(row[6]).items():
+        for index, counts in enumerate(term_counts):
+            for term, frequency in counts.items():
                 entry = raw_postings.get(term)
                 if entry is None:
                     entry = ([], [])
@@ -98,7 +123,7 @@ class BlooRecallIndex:
             term: (np.array(indices, dtype=np.int64), np.array(frequencies, dtype=np.float32))
             for term, (indices, frequencies) in raw_postings.items()
         }
-        del raw_postings
+        del raw_postings, term_counts
         self.average_length = float(self.token_counts.mean()) if self.count else 1.0
 
         dimension = int(self.metadata.get("embedding_dimension", 0) or 0)
@@ -117,10 +142,7 @@ class BlooRecallIndex:
         self.matrix = matrix
 
         # Path metadata is identical for every chunk of a file; score it once per path.
-        self.path_terms: dict[str, set[str]] = {}
-        for path_value, project in zip(self.paths, self.projects):
-            if path_value not in self.path_terms:
-                self.path_terms[path_value] = set(tokens(f"{path_value} {project}"))
+        self.path_terms = _path_terms(self.paths, self.projects, [row[14] for row in rows])
         self.path_index = np.array(_path_indices(self.paths), dtype=np.int32)
         self.unique_paths = _unique_paths(self.paths)
         self.min_mtime = float(self.mtimes.min()) if self.count else 0.0
@@ -140,8 +162,6 @@ class BlooRecallIndex:
                 indexed_hash=row["content_hash"],
                 indexed_at=row["indexed_at"],
                 refreshed_at=refreshed_at,
-                cached_text_hashes=self._cached_text_hashes,
-                path_text_hashes=self._path_text_hashes.get(row["path"], []),
             )
             row["trust"] = {
                 "verdict": check.verdict.value,
@@ -149,7 +169,6 @@ class BlooRecallIndex:
                 "file_exists": check.file_exists,
                 "hash_match": check.on_disk_hash is not None
                 and check.on_disk_hash == check.indexed_hash,
-                "embedding_fresh": check.embedding_fresh,
             }
         return results
 
@@ -163,14 +182,21 @@ class BlooRecallIndex:
                 continue
             indices, frequencies = postings
             occurrences = query_terms.count(term)
-            df = int(indices.size)
-            idf = math.log(1.0 + (self.count - df + 0.5) / (df + 0.5))
+            idf = self._idf(int(indices.size))
             contribution = idf * frequencies * (BM25_K1 + 1) / (
                 frequencies + BM25_K1 * length_norm[indices]
             )
             scores[indices] += contribution * occurrences
             matched_terms[indices] += 1.0
         return scores, matched_terms
+
+    def _idf(self, df: int) -> float:
+        return math.log(1.0 + (self.count - df + 0.5) / (df + 0.5))
+
+    def term_weights(self, question: str) -> dict[str, float]:
+        """The query's terms weighted by rarity (BM25's IDF), for windowing snippets."""
+        return {term: self._idf(self.postings[term][0].size if term in self.postings else 0)
+                for term in set(tokens(question))}
 
     def rank(
         self,
@@ -187,7 +213,7 @@ class BlooRecallIndex:
         """
         if not self.count:
             return []
-        query_terms = tokens(question)
+        query_terms = keyword_terms(question)
         query_set = set(query_terms)
         lexical, matched_terms = self._bm25(query_terms)
         maximum = float(lexical.max()) if self.count else 0.0
@@ -207,9 +233,10 @@ class BlooRecallIndex:
                     + (1.0 - dense_weight) * bm25_normalized
                 )
 
+        query_words = set(words(question))
         overlap_by_path = np.array(
             [
-                len(query_set & self.path_terms[path_value]) / max(1, len(query_set))
+                len(query_words & self.path_terms[path_value]) / max(1, len(query_words))
                 for path_value in self.unique_paths
             ],
             dtype=np.float32,
@@ -225,6 +252,11 @@ class BlooRecallIndex:
             + float(policy["metadata_weight"]) * metadata_overlap
         )
         coverage = matched_terms / max(1, len(query_set))
+        if query_vector is None:
+            # Keyword-only search must not pad its list with files that match nothing (ranked by
+            # recency alone): a hit needs a query term in its text or in its path.
+            matched = (lexical > 0) | (metadata_overlap > 0)
+            scores = np.where(matched, scores, -np.inf).astype(np.float32)
         if project:
             needle = project.casefold()
             allowed = np.array([needle in label.casefold() for label in self.projects], dtype=bool)
@@ -287,10 +319,10 @@ def _dense_scale(similarity: np.ndarray, fusion: str) -> np.ndarray:
     raise ValueError(f"unknown fusion mode '{fusion}'; expected one of {', '.join(FUSION_MODES)}")
 
 
-def _reciprocal_ranks(values: np.ndarray, k: int) -> np.ndarray:
+def _ranks(values: np.ndarray) -> np.ndarray:
     ranks = np.empty(values.size, dtype=np.float32)
     ranks[np.argsort(-values, kind="stable")] = np.arange(1, values.size + 1, dtype=np.float32)
-    return 1.0 / (k + ranks)
+    return ranks
 
 
 def _rrf(similarity: np.ndarray, lexical: np.ndarray, dense_weight: float, k: int) -> np.ndarray:
@@ -302,10 +334,35 @@ def _rrf(similarity: np.ndarray, lexical: np.ndarray, dense_weight: float, k: in
     the weight means the same thing for any model or corpus size (minmax rescaling fixes the
     scale too, but anchors to the query's least similar chunk, so its effective weight drifts as the
     corpus grows).
+
+    Both orders rank every chunk: one with no keyword match shares the rank after the last match
+    instead of getting nothing from BM25. No keyword evidence then counts as the weakest evidence
+    rather than as worse than any, which (v1.1) buried a right note that shares no word with the
+    query under every chunk that shares one.
     """
-    fused = dense_weight * _reciprocal_ranks(similarity, k)
-    fused += (1.0 - dense_weight) * np.where(lexical > 0, _reciprocal_ranks(lexical, k), 0.0)
+    matched = lexical > 0
+    keyword_ranks = np.where(matched, _ranks(lexical), np.count_nonzero(matched) + 1)
+    fused = dense_weight / (k + _ranks(similarity))
+    fused += (1.0 - dense_weight) / (k + keyword_ranks)
     return (fused / (float(fused.max()) or 1.0)).astype(np.float32)
+
+
+def _path_terms(paths: list[str], projects: list[str], root_labels: list[str]) -> dict[str, set[str]]:
+    """Words naming where each file sits: its project label, its folders and its file stem.
+
+    The folders above a corpus root (/home/<user>/notes) are shared by every file in it, so they
+    carry no signal; cut them by taking the deepest folder all of that root's files share.
+    """
+    folders_by_root: dict[str, set[str]] = {}
+    for path_value, root_label in zip(paths, root_labels):
+        folders_by_root.setdefault(root_label, set()).add(os.path.dirname(path_value))
+    base_by_root = {label: os.path.commonpath(folders) for label, folders in folders_by_root.items()}
+    terms: dict[str, set[str]] = {}
+    for path_value, project, root_label in zip(paths, projects, root_labels):
+        if path_value not in terms:
+            below = os.path.relpath(path_value, base_by_root[root_label])
+            terms[path_value] = set(words(f"{project} {os.path.splitext(below)[0]}"))
+    return terms
 
 
 def _path_indices(paths: list[str]) -> list[int]:
@@ -333,24 +390,51 @@ def _fingerprint(path: Path) -> tuple[float, int]:
     return (stat.st_mtime, stat.st_size)
 
 
-def snippet_for(text: str, question: str, limit: int) -> str:
-    """Window the chunk around the densest run of query terms, then flatten it."""
+def snippet_for(
+    text: str, question: str, limit: int, weights: dict[str, float] | None = None
+) -> str:
+    """Flatten the chunk and window it on the stretch that holds the most query terms.
+
+    Each distinct term counts once per window, by its weight: the index's IDF, so a rare
+    "kiln" outweighs a "how" the query also contains (1.0 each without weights). The window
+    opens a little before its first hit and is trimmed to whole words.
+    """
     flat = WHITESPACE_RE.sub(" ", text).strip()
     if len(flat) <= limit:
         return flat
-    lowered = flat.casefold()
-    positions = [
-        lowered.find(term) for term in {token for token in tokens(question) if len(token) > 2}
-    ]
-    hits = sorted(position for position in positions if position >= 0)
+    wanted = {token for token in tokens(question) if len(token) > 2}
+    hits: list[tuple[int, str]] = []
+    for match in TOKEN_RE.finditer(flat):
+        term = match.group().casefold()
+        if term in wanted:
+            hits.append((match.start(), term))
     if not hits:
         return flat[:limit].rstrip() + "…"
-    centre = hits[len(hits) // 2]
-    start = max(0, centre - limit // 3)
-    window = flat[start : start + limit].strip()
+    weight = (weights or {}).get
+    span = limit * 3 // 4  # the hits must fit here; the rest of the window is lead-in
+    best, best_score, right = 0, -1.0, 0
+    inside: Counter[str] = Counter()
+    for left, (position, term) in enumerate(hits):
+        while right < len(hits) and hits[right][0] < position + span:
+            inside[hits[right][1]] += 1
+            right += 1
+        score = sum(weight(name, 1.0) for name in inside)
+        if score > best_score:
+            best, best_score = left, score
+        inside[term] -= 1
+        if not inside[term]:
+            del inside[term]
+    anchor = hits[best][0]
+    start = max(0, min(anchor - (limit - span), len(flat) - limit))
+    if start:
+        boundary = flat.find(" ", start, anchor)
+        start = boundary + 1 if boundary >= 0 else start
+    window = flat[start : start + limit]
+    if start + limit < len(flat) and " " in window:
+        window = window[: window.rfind(" ")]
     prefix = "…" if start > 0 else ""
-    suffix = "…" if start + limit < len(flat) else ""
-    return f"{prefix}{window}{suffix}"
+    suffix = "…" if start + len(window) < len(flat) else ""
+    return f"{prefix}{window.strip()}{suffix}"
 
 
 class SearchEngine:
@@ -369,6 +453,32 @@ class SearchEngine:
             if self._index is None or self._index.fingerprint != _fingerprint(self.index_path):
                 self._index = BlooRecallIndex(self.index_path)
             return self._index
+
+    def _query_vector(
+        self, index: BlooRecallIndex, question: str
+    ) -> tuple[list[float] | None, str | None]:
+        """Embed the query, or say why this search has to rank by keyword alone.
+
+        Ollama down or the model missing must not take search down with it, and a vector from a
+        model other than the index's would rank chunks by noise (or not fit the matrix at all),
+        so each falls back to the keyword index with a warning instead of failing the query.
+        """
+        indexed_model = index.metadata.get("embedding_model", "")
+        if indexed_model and indexed_model != self.embedder.model:
+            return None, (
+                f"index was built with '{indexed_model}' but config asks for "
+                f"'{self.embedder.model}'; run 'bloorecall refresh --full' to re-embed"
+            )
+        try:
+            vector = self.embedder.embed_one(question)
+        except EmbeddingUnavailable as error:
+            return None, str(error)
+        if index.count and len(vector) != index.dimension:
+            return None, (
+                f"the query embedding has {len(vector)} dimensions but the index holds "
+                f"{index.dimension}; run 'bloorecall refresh --full' to re-embed"
+            )
+        return vector, None
 
     def search(
         self,
@@ -392,21 +502,19 @@ class SearchEngine:
         policy["top_k"] = limit
 
         index = self.index
-        # Ollama down or the model missing must not take search down with it: keep answering
-        # from the keyword index and say so, instead of failing the whole query.
-        retrieval = "hybrid"
-        warning: str | None = None
-        vector: list[float] | None
-        try:
-            vector = self.embedder.embed_one(question)
-        except EmbeddingUnavailable as error:
-            vector, retrieval, warning = None, "keyword-only", str(error)
+        vector, warning = self._query_vector(index, question)
+        retrieval = "keyword-only" if vector is None else "hybrid"
         results = index.rank(question, vector, policy, project=project)[:limit]
+        if project and not any(project.casefold() in label.casefold() for label in index.project_labels):
+            labels = ", ".join(index.project_labels[:12]) + (", …" if len(index.project_labels) > 12 else "")
+            unmatched = f"no project label contains '{project}' (labels: {labels})"
+            warning = f"{warning}; {unmatched}" if warning else unmatched
 
         snippet_chars = int(defaults.get("snippet_chars", 240))
+        weights = index.term_weights(question)
         for rank, row in enumerate(results, start=1):
             row["rank"] = rank
-            row["snippet"] = snippet_for(row.pop("text"), question, snippet_chars)
+            row["snippet"] = snippet_for(row.pop("text"), question, snippet_chars, weights)
         # Heimdall-style per-hit disk verification: stat + re-hash before the
         # agent sees the result. Adds two file reads per top hit — cheap on a
         # local box, worth the staleness guarantee.

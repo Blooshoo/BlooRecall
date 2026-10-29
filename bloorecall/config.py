@@ -17,6 +17,8 @@ REQUIRED_KEYS = (
     "embedding",
     "corpus_roots",
     "allowed_extensions",
+    "chunk_chars",
+    "chunk_overlap_chars",
     "exclusions",
     "active_policy",
     "policies",
@@ -57,6 +59,7 @@ def load_config(explicit: str | Path | None = None) -> dict[str, Any]:
     missing = [key for key in REQUIRED_KEYS if key not in data]
     if missing:
         raise RuntimeError(f"BlooRecall config {path} is missing keys: {', '.join(missing)}")
+    _validate_corpus(data, path)
     _validate_policies(data, path)
     data["_config_path"] = str(path)
     return data
@@ -106,6 +109,23 @@ def default_config(roots: list[dict[str, Any]]) -> dict[str, Any]:
         "search_defaults": {"top_k": 10, "max_top_k": 50, "snippet_chars": 240},
         "vector_cache_days": 14,
     }
+
+
+def _validate_corpus(data: dict[str, Any], path: Path) -> None:
+    # An empty root list would empty the index on the next refresh, and an overlap as long as
+    # the chunk makes the packer step one character at a time: refuse both up front.
+    roots = data["corpus_roots"]
+    if not isinstance(roots, list) or not roots or not all(
+        isinstance(root, dict) and root.get("path") for root in roots
+    ):
+        raise RuntimeError(f"corpus_roots in {path} must list at least one folder as {{\"path\": ...}}")
+    size, overlap = data["chunk_chars"], data["chunk_overlap_chars"]
+    if not (isinstance(size, int) and isinstance(overlap, int) and 0 <= overlap < size):
+        raise RuntimeError(
+            f"{path}: chunk_chars must be a positive integer and chunk_overlap_chars 0 or more, below it"
+        )
+    if int(data.get("max_file_bytes", 1)) < 1:
+        raise RuntimeError(f"max_file_bytes in {path} must be positive")
 
 
 def _validate_policies(data: dict[str, Any], path: Path) -> None:

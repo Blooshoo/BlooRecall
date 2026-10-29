@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import urllib.error
@@ -54,7 +55,15 @@ class OllamaEmbedder:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 result: dict[str, Any] = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError) as error:
+        except urllib.error.HTTPError as error:
+            # Ollama explains itself in the body ('model "x" not found, try pulling it first').
+            raise EmbeddingUnavailable(
+                f"local Ollama rejected the embedding request for {self.model} at {self.endpoint}: "
+                f"HTTP {error.code}: {_error_detail(error)}"
+            ) from error
+        except (OSError, http.client.HTTPException, ValueError) as error:
+            # OSError covers refused/reset connections and timeouts (URLError is one); a reply
+            # cut off mid-body is an HTTPException; one that is not JSON is a ValueError.
             raise EmbeddingUnavailable(
                 f"local Ollama embedding request failed for {self.model} at {self.endpoint}: {error}"
             ) from error
@@ -65,6 +74,14 @@ class OllamaEmbedder:
 
     def embed_one(self, text: str) -> list[float]:
         return self.embed([text])[0]
+
+
+def _error_detail(error: urllib.error.HTTPError) -> str:
+    try:
+        detail = json.loads(error.read().decode("utf-8")).get("error")
+    except (OSError, ValueError, AttributeError):
+        detail = None
+    return str(detail) if detail else str(error.reason)
 
 
 def normalize(vector: list[float]) -> list[float]:

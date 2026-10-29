@@ -11,15 +11,18 @@ Checks performed
   indexed ``content_hash`` (catches size+mtime-preserving rewrites, which
   BlooRecall's mtime+size skip would otherwise miss — this is the ``--deep``
   guarantee).
+* **Changed** — shallow mode's stand-in for hash drift: the file's size or mtime
+  differs from the index (the same test refresh uses to skip unchanged files).
 * **Orphan** — a source whose canonical path is not under any *walked* corpus
   root (analogous to Heimdall's exact-ownership invariant).
-* **Unindexed** — a walkable file that is on disk but absent from the index.
+* **Unindexed** — a walkable file that is on disk but absent from the index, unless
+  refresh refuses it on content (secret-shaped, not UTF-8, or blank).
 * **Ownership** — a source whose on-disk file is not owned by the local user.
 
 Exit codes
 ----------
 * ``0`` — clean (index matches disk)
-* ``1`` — drift detected (ghost, hash drift, orphan, or unindexed)
+* ``1`` — drift detected (ghost, hash drift, changed, orphan, or unindexed)
 * ``2`` — error (could not open index, missing config, etc.)
 """
 from __future__ import annotations
@@ -35,7 +38,7 @@ from typing import Any
 
 from . import store
 from .config import index_path
-from .corpus import Exclusions, walk_corpus
+from .corpus import read_source, secret_reason, walk_corpus
 from .util import sha256_file
 
 EXIT_CLEAN = 0
@@ -51,6 +54,7 @@ class DriftReport:
     clean: int = 0
     ghosts: list[dict[str, Any]] = field(default_factory=list)
     hash_drift: list[dict[str, Any]] = field(default_factory=list)
+    changed: list[dict[str, Any]] = field(default_factory=list)
     orphans: list[dict[str, Any]] = field(default_factory=list)
     unindexed: list[dict[str, Any]] = field(default_factory=list)
     ownership_issues: list[dict[str, Any]] = field(default_factory=list)
@@ -62,7 +66,7 @@ class DriftReport:
     @property
     def has_drift(self) -> bool:
         return bool(
-            self.ghosts or self.hash_drift or self.orphans
+            self.ghosts or self.hash_drift or self.changed or self.orphans
             or self.unindexed or self.ownership_issues
         )
 
@@ -95,12 +99,18 @@ def _is_under_root(path: str, resolved_roots: set[Path]) -> bool:
     return any(resolved == root or root in resolved.parents for root in resolved_roots)
 
 
-def _load_indexed_sources(connection) -> dict[str, tuple[str, int, float]]:
-    """Return {canonical_path: (content_hash, byte_count, indexed_at)} from the index."""
+def _load_indexed_sources(connection) -> dict[str, tuple[str, int, float, float]]:
+    """Return {canonical_path: (content_hash, byte_count, mtime, indexed_at)} from the index."""
     rows = connection.execute(
-        "SELECT canonical_path, content_hash, byte_count, indexed_at FROM sources"
+        "SELECT canonical_path, content_hash, byte_count, mtime, indexed_at FROM sources"
     ).fetchall()
-    return {row[0]: (row[1], row[2], row[3]) for row in rows}
+    return {row[0]: (row[1], row[2], row[3], row[4]) for row in rows}
+
+
+def _refused_on_content(path: Path) -> bool:
+    """True for a walkable file refresh skips by design, which is not drift."""
+    payload = read_source(path)
+    return payload is None or bool(secret_reason(payload[1])) or not payload[1].strip()
 
 
 def run_drift_audit(
@@ -118,8 +128,8 @@ def run_drift_audit(
     deep
         If ``True`` (default), always re-hash every source — the ``--deep``
         guarantee that catches size+mtime-preserving rewrites.  If ``False``,
-        only stat-check (cheaper, catches missing/ownership but not silent
-        content rewrites).
+        only stat-check: size and mtime against the index (cheaper, catches
+        ordinary edits but not a rewrite that keeps both).
     as_json
         Emit a JSON summary on stdout.
     """
@@ -165,7 +175,7 @@ def run_drift_audit(
     report.checked = len(sources)
 
     # Phase 1: verify each indexed source against disk
-    for canonical, (content_hash, byte_count, indexed_at_src) in sorted(sources.items()):
+    for canonical, (content_hash, byte_count, mtime, indexed_at_src) in sorted(sources.items()):
         file_path = Path(canonical)
         try:
             exists = file_path.exists()
@@ -220,14 +230,23 @@ def run_drift_audit(
             else:
                 report.clean += 1
         else:
-            report.clean += 1
+            stat = file_path.stat()
+            if stat.st_size != byte_count or abs(stat.st_mtime - mtime) >= 1e-6:
+                report.changed.append({
+                    "canonical_path": canonical,
+                    "indexed_bytes": byte_count,
+                    "on_disk_bytes": stat.st_size,
+                    "reason": "size or mtime differs from the index (edited without re-index)",
+                })
+            else:
+                report.clean += 1
 
     # Phase 2: walk corpus roots and find files that should be indexed but aren't
     walk_result = walk_corpus(config)
     indexed_canonical = set(sources.keys())
     for source_file in walk_result.sources:
         canonical = str(source_file.path)
-        if canonical not in indexed_canonical:
+        if canonical not in indexed_canonical and not _refused_on_content(source_file.path):
             try:
                 content_hash = sha256_file(source_file.path)
             except OSError:
@@ -263,6 +282,12 @@ def _print_human(report: DriftReport, deep: bool) -> None:
             print(f"    X {item['canonical_path']}")
         if len(report.hash_drift) > 10:
             print(f"    ...{len(report.hash_drift) - 10} more")
+    if report.changed:
+        print(f"  changed   {len(report.changed)} sources differ from the index in size or mtime")
+        for item in report.changed[:10]:
+            print(f"    ~ {item['canonical_path']}")
+        if len(report.changed) > 10:
+            print(f"    ...{len(report.changed) - 10} more")
     if report.orphans:
         print(f"  orphans   {len(report.orphans)} sources not under a walked root")
         for item in report.orphans[:10]:

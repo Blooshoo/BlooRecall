@@ -225,6 +225,36 @@ class ChunkerOverrideTest(unittest.TestCase):
             refresh(self.config, full=True, embedder=FakeEmbedder())
 
 
+class HaikuProbeTest(unittest.TestCase):
+    """The fusion stress probe: its data keeps the no-shared-words rule, and its runner runs."""
+
+    def test_no_query_shares_a_content_word_with_its_poem(self) -> None:
+        from bench.haiku_probe import PROBE_DIR
+        from bench.splits import read_queries
+        from bloorecall.search import keyword_terms
+        from bloorecall.util import tokens
+
+        queries = read_queries(PROBE_DIR / "queries.jsonl")
+        self.assertEqual(len(queries), 40)
+        self.assertEqual(len(list((PROBE_DIR / "corpus").glob("haiku-*.md"))), 40)
+        for query in queries:
+            poem = (PROBE_DIR / "corpus" / query["answer"]).read_text(encoding="utf-8")
+            self.assertEqual(len(poem.strip().splitlines()), 3, query["answer"])
+            shared = set(keyword_terms(query["query"])) & set(tokens(poem)) - {"s"}
+            self.assertFalse(shared, f"{query['id']} shares {sorted(shared)} with {query['answer']}")
+
+    def test_probe_scores_each_system(self) -> None:
+        from bench.haiku_probe import SYSTEMS, probe
+        from bloorecall.util import PROJECT_ROOT
+
+        config = json.loads((PROJECT_ROOT / "bench" / "config.bench.json").read_text(encoding="utf-8"))
+        config["embedding"]["model"] = FakeEmbedder.model
+        config["_config_path"] = "haiku-probe-test"
+        scores = probe(config, embedder=FakeEmbedder())
+        self.assertEqual(list(scores), [system_id for system_id, _, _ in SYSTEMS])
+        self.assertTrue(all(0.0 <= row["mrr@10"] <= 1.0 for row in scores.values()))
+
+
 class BlooRecallSystemTest(unittest.TestCase):
     """End-to-end through the bench system interface, fake embedder, no Ollama."""
 

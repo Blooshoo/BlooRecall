@@ -17,10 +17,18 @@ Latency reported for it is THIS implementation's (pure Python), not the C
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-from bloorecall.util import tokens
+# The tokenizer is part of the frozen spec. BlooRecall's own tokenizer has since changed
+# (v1.2 drops trailing punctuation), so the baseline keeps the v0 regex instead of importing
+# the engine's: a BlooRecall change must never move the baseline it is measured against.
+V0_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]*", re.IGNORECASE)
+
+
+def tokens(text: str) -> List[str]:
+    return [token.casefold() for token in V0_TOKEN_RE.findall(text)]
 
 # Compact standard English stopword list, frozen for the study. Queries are
 # short questions ("how do we retry a dropped socket"), so the common

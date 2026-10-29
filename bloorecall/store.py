@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 from array import array
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     embedding BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chunks_path_idx ON chunks(canonical_path);
+CREATE INDEX IF NOT EXISTS chunks_text_hash_idx ON chunks(text_hash);
 CREATE TABLE IF NOT EXISTS vectors (
     text_hash TEXT NOT NULL,
     model TEXT NOT NULL,
@@ -89,6 +91,11 @@ def connect_write(path: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.executescript(SCHEMA)
     connection.commit()
+    # The index holds the text of every note it covers: owner-only, whatever the umask. SQLite
+    # creates -wal and -shm with the database file's mode; older ones are fixed here too.
+    for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+        if candidate.exists():
+            os.chmod(candidate, 0o600)
     return connection
 
 
@@ -191,8 +198,26 @@ def chunk_row(
         text_hash,
         text,
         token_count,
-        json.dumps(term_counts, sort_keys=True, separators=(",", ":")),
+        _term_counts_json(term_counts),
         embedding_blob,
+    )
+
+
+def _term_counts_json(term_counts: dict[str, int]) -> str:
+    return json.dumps(term_counts, sort_keys=True, separators=(",", ":"))
+
+
+def chunk_texts(connection: sqlite3.Connection) -> list[tuple[str, str]]:
+    return connection.execute("SELECT chunk_id, text FROM chunks").fetchall()
+
+
+def update_term_counts(
+    connection: sqlite3.Connection, rows: list[tuple[str, dict[str, int]]]
+) -> None:
+    """Rewrite stored BM25 term counts in place (a tokenizer change); vectors are untouched."""
+    connection.executemany(
+        "UPDATE chunks SET token_count = ?, term_counts_json = ? WHERE chunk_id = ?",
+        [(sum(counts.values()), _term_counts_json(counts), chunk_id) for chunk_id, counts in rows],
     )
 
 
@@ -204,6 +229,19 @@ def cached_vectors(connection: sqlite3.Connection, model: str, text_hashes: list
         rows = connection.execute(
             f"SELECT text_hash, embedding FROM vectors WHERE model = ? AND text_hash IN ({placeholders})",
             [model, *batch],
+        ).fetchall()
+        found.update({row[0]: row[1] for row in rows})
+    return found
+
+
+def chunk_vectors(connection: sqlite3.Connection, text_hashes: list[str]) -> dict[str, bytes]:
+    """Vectors of indexed chunks holding this text, whatever the age of their cache entry."""
+    found: dict[str, bytes] = {}
+    for start in range(0, len(text_hashes), 400):
+        batch = text_hashes[start : start + 400]
+        placeholders = ",".join("?" for _ in batch)
+        rows = connection.execute(
+            f"SELECT text_hash, embedding FROM chunks WHERE text_hash IN ({placeholders})", batch
         ).fetchall()
         found.update({row[0]: row[1] for row in rows})
     return found
@@ -238,21 +276,10 @@ def load_search_rows(connection: sqlite3.Connection, allowed_permissions: set[st
         f"""SELECT c.chunk_id, c.canonical_path, c.ordinal, c.content_hash, c.text,
                    c.token_count, c.term_counts_json, c.embedding,
                    s.mtime, s.project, s.permissions, s.file_type,
-                   c.text_hash, s.indexed_at
+                   c.text_hash, s.indexed_at, s.root_label
             FROM chunks c JOIN sources s ON s.canonical_path = c.canonical_path
             WHERE s.permissions IN ({placeholders})
             ORDER BY c.canonical_path, c.ordinal""",
         sorted(allowed_permissions),
     ).fetchall()
 
-
-def cached_text_hashes(connection: sqlite3.Connection, model: str) -> set[str]:
-    """Return the set of text_hash values that have a cached vector for *model*.
-
-    Used by the trust-verdict layer to decide whether a hit's embedding cache is
-    still fresh rather than pruned.
-    """
-    rows = connection.execute(
-        "SELECT text_hash FROM vectors WHERE model = ?", (model,)
-    ).fetchall()
-    return {row[0] for row in rows}
