@@ -72,8 +72,15 @@ def command_search(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
     results = payload["results"]
+    keyword_note = (
+        f"note: keyword-only results ({payload.get('warning', '')})"
+        if payload.get("retrieval") == "keyword-only"
+        else ""
+    )
     if not results:
         _print(f"no matches for {payload['query']!r}")
+        if keyword_note:
+            _print(keyword_note)
         return 1
     for row in results:
         print(f"{row['rank']:>2}. {row['score']:.4f}  {_relative_home(row['path'])}")
@@ -91,8 +98,8 @@ def command_search(args: argparse.Namespace) -> int:
         f"{index['source_count']} files / {index['chunk_count']} chunks · "
         f"index refreshed {index['refreshed_at_iso'][:19]}Z"
     )
-    if payload.get("retrieval") == "keyword-only":
-        _print(f"note: keyword-only results (embeddings unavailable: {payload.get('warning', '')})")
+    if keyword_note:
+        _print(keyword_note)
     return 0
 
 
@@ -231,6 +238,13 @@ def command_doctor(args: argparse.Namespace) -> int:
     except ImportError as error:
         problems += 1
         print(f"mcp sdk     FAIL cannot load the MCP server ({error}) — pip install --user mcp")
+
+    if args.verify_drift and target.exists():
+        from .verify_drift import run_drift_audit
+
+        print()
+        if run_drift_audit(config, deep=True):
+            problems += 1
     return 1 if problems else 0
 
 

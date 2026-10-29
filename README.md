@@ -40,7 +40,7 @@ Requires Python 3.12+, `numpy`, the `mcp` SDK, and a running local Ollama with a
 git clone <this repo> && cd bloorecall
 pip install numpy mcp
 ollama pull qwen3-embedding:0.6b          # any Ollama embedding model works; set it in config
-python3 -m unittest discover -s tests     # 76 tests, no network needed
+python3 -m unittest discover -s tests     # no network needed
 ```
 
 Put `bin/` on your `PATH` for a short command, or run `./bin/bloorecall` in place.
@@ -89,14 +89,16 @@ claude mcp add bloorecall -- /abs/path/to/bloorecall/bin/bloorecall-mcp
    one chunk. A no-change refresh is ~instant.
 2. **Search**: embed the query, rank every chunk by meaning (dense) and by keyword (BM25), and
    fuse the two orders with reciprocal-rank fusion, plus small recency and path-match bonuses (a
-   named, editable policy). Fusing ranks rather than raw scores keeps either signal from drowning
+   named, editable policy; a path match is a query word naming the file or one of its folders
+   under the corpus root). Fusing ranks rather than raw scores keeps either signal from drowning
    out the other. Keep the best chunk per file, re-rank the top results with a term-coverage
-   bonus, then verify each hit against disk.
+   bonus, then verify each hit against disk. If the embedder is down, or the index was built with
+   a different model than the config names, search ranks by keyword alone and says why.
 
 ## Benchmark
 
 Against a one-pass grep baseline (what an agent gets from a single `rg` search) on a 251-file
-synthetic corpus, BlooRecall as shipped reaches **Recall@5 0.97 vs grep's 0.73** (MRR@10 0.89 vs
+synthetic corpus, BlooRecall v1.1 reaches **Recall@5 0.97 vs grep's 0.73** (MRR@10 0.89 vs
 0.58), and matches or beats grep in every query category.
 
 v1.0 shipped a linear blend that, it turned out, let BM25 overrule the embeddings (0.87 / 0.77,
@@ -104,6 +106,15 @@ behind embeddings alone at 0.95 / 0.86). v1.1 fuses ranks instead: it sits level
 embeddings-only on meaning-style queries and keeps keyword search's edge on exact identifiers.
 The fusion was picked on the dev split (`python3 -m bench.sweep`) and confirmed once on test;
 the report has the diagnosis.
+
+v1.2 fixes two ranking bugs rather than tuning anything: the tokenizer kept a sentence's full
+stop (`backoff.` never matched `backoff`; 7% of the corpus's tokens), and whole paths were one
+token, so the path-match bonus almost never fired. On this benchmark both are within noise. They
+were measured on the same harness with a stand-in embedder (all-MiniLM-L6-v2: the work was done
+without Ollama), where test MRR@10 for the shipped policy moved +0.011 (95% CI [-0.023, +0.046]),
+Recall@5 not at all, and the grep baseline stayed byte-identical. The qwen3 numbers here and in
+the report are v1.1's; `python3 -m bench.run --system all --split test --fresh` then
+`python3 -m bench.report` brings them up to date.
 
 ![Recall@5 by system](docs/benchmark.svg)
 
@@ -123,16 +134,33 @@ project's `var/`.
 always means one behavior. To get v1.1's ranking, copy the `hybrid-rrf-v1` block from
 `config.example.json` into your `policies` and set `"active_policy": "hybrid-rrf-v1"`.
 
+**Upgrading to v1.2:** nothing to run. Search re-tokenizes an older index in memory, and the
+next `bloorecall refresh` rewrites it on disk without re-embedding (its summary counts
+`retokenized` chunks). Behavior changes:
+- Results no longer carry `trust.embedding_fresh`. It read the embedding cache, whose entries
+  expire after `vector_cache_days`, so every file left unedited for two weeks came back
+  `weak`/`[DRIFT]`. Verdicts now depend on the file alone.
+- `refresh` drops the files of a root you remove from the config. A root that is only missing
+  on disk (an unmounted drive) still keeps its files until it comes back.
+- Keyword-only search (embedder down) returns only files that share a word with the query,
+  instead of padding the list by recency.
+- Shallow `verify` compares each file's size and mtime with the index (it used to check only
+  that files exist), and files that refresh refuses on content (secret-shaped, not UTF-8,
+  blank) no longer count as unindexed drift.
+
 ## Keeping it fresh
 
-`bloorecall refresh` is incremental and idempotent. `scripts/bloorecall-refresh.sh` is a cron-ready
-wrapper (its header has a sample crontab line). `bloorecall verify --deep` runs a read-only drift
-audit (exit 1 on drift).
+`bloorecall refresh` is incremental and idempotent: an edit re-embeds only the chunks whose text
+changed, however long the file sat untouched. `scripts/bloorecall-refresh.sh` is a cron-ready
+wrapper (its header has a sample crontab line). `bloorecall verify` runs a read-only drift audit
+against size and mtime, `--deep` re-hashes every file (exit 1 on drift);
+`bloorecall doctor --verify-drift` adds the deep audit to the health check.
 
 ## Status
 
-v1.1. 76 tests, all local. Born as a throwaway tool for personal knowledge-base research that turned
-out to be genuinely useful, so it's shared in case it helps you too.
+v1.2. Tests run locally, no network or Ollama needed. Born as a throwaway tool for personal
+knowledge-base research that turned out to be genuinely useful, so it's shared in case it helps
+you too.
 
 ## License
 

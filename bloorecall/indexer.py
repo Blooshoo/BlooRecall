@@ -18,7 +18,15 @@ from .corpus import (
 )
 from .embeddings import OllamaEmbedder
 from .store import SourceRow
-from .util import batched, ensure_write_target, sha256_bytes, sha256_text, stable_json, tokens
+from .util import (
+    TOKENIZER_VERSION,
+    batched,
+    ensure_write_target,
+    sha256_bytes,
+    sha256_text,
+    stable_json,
+    tokens,
+)
 
 Progress = Callable[[str], None]
 
@@ -28,7 +36,12 @@ def _noop(_message: str) -> None:
 
 
 class EmbeddingPool:
-    """Embeds only chunk text that is not already cached under the active model."""
+    """Embeds only chunk text that has no vector yet under the active model.
+
+    A vector comes from the cache (text embedded within vector_cache_days) or from an indexed
+    chunk that still holds the same text. refresh() only runs against an index built with the
+    active model (or a fresh one), so every chunk vector is that model's.
+    """
 
     def __init__(self, connection, embedder: OllamaEmbedder, progress: Progress) -> None:
         self.connection = connection
@@ -48,9 +61,12 @@ class EmbeddingPool:
         now = time.time()
         wanted = sorted(self.pending)
         blobs = store.cached_vectors(self.connection, self.embedder.model, wanted)
-        self.reused += len(blobs)
         if blobs:
             store.mark_vectors_used(self.connection, self.embedder.model, sorted(blobs), now)
+        # Text an unchanged paragraph still holds keeps its vector on the chunk even after its
+        # cache entry expires, so an edit to a long-untouched file re-embeds only what changed.
+        blobs.update(store.chunk_vectors(self.connection, [h for h in wanted if h not in blobs]))
+        self.reused += len(blobs)
         missing = [text_hash for text_hash in wanted if text_hash not in blobs]
         if missing:
             self.progress(f"embedding {len(missing)} new chunks ({len(blobs)} reused from cache)")
@@ -128,8 +144,17 @@ def refresh(
                 "empty_after_chunking": 0,
                 "orphan_kept": 0,
                 "vectors_pruned": 0,
+                "retokenized": 0,
             }
         )
+        if metadata.get("tokenizer_version") != TOKENIZER_VERSION:
+            # Stored term counts come from an older tokenizer: re-derive them from the chunk text.
+            # Chunks re-chunked below get fresh counts anyway; nothing is re-embedded.
+            rows = [(chunk_id, Counter(tokens(text))) for chunk_id, text in store.chunk_texts(connection)]
+            store.update_term_counts(connection, rows)
+            stats["retokenized"] = len(rows)
+            if rows:
+                say(f"re-tokenized {len(rows)} stored chunks for tokenizer v{TOKENIZER_VERSION}")
         pool = EmbeddingPool(connection, embedder, say)
         # (canonical_path, ordinal, text_hash, text, content_hash) awaiting a vector
         staged: list[tuple[str, int, str, str, str]] = []
@@ -235,9 +260,12 @@ def refresh(
             store.replace_chunks(connection, canonical, rows)
             store.upsert_source(connection, staged_sources[canonical])
 
-        covered = tuple(walk.covered_roots)
+        # A file under a root that is missing right now (an unmounted drive) is kept until the
+        # root comes back. One under no configured root at all (the root was dropped from the
+        # config) goes, like a file deleted from a root that is still there.
+        missing = tuple(str(Path(root).resolve()) for root in walk.missing_roots)
         for canonical in sorted(set(known) - seen):
-            if not any(canonical == root or canonical.startswith(f"{root}/") for root in covered):
+            if any(canonical == root or canonical.startswith(f"{root}/") for root in missing):
                 stats["orphan_kept"] += 1
                 continue
             store.delete_source(connection, canonical)
@@ -256,6 +284,7 @@ def refresh(
                 "schema_version": store.SCHEMA_VERSION,
                 "index_format": config["index_format"],
                 "parse_version": config["parse_version"],
+                "tokenizer_version": TOKENIZER_VERSION,
                 "embedding_model": embedder.model,
                 "embedding_dimension": dimension,
                 "chunk_count": chunk_count,

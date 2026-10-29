@@ -21,10 +21,14 @@ specs, notes and runbooks only; secrets, credential stores and private memory ar
 excluded by design and credential-shaped queries are refused.
 
 Each result carries a **trust verdict** (Heimdall-style disk verification):
-- **strong** — file on disk matches the indexed hash and embedding cache is fresh.
-- **rebuilt** — file matches disk but was re-indexed in the most recent refresh.
-- **weak** — file exists but the hash drifted or the embedding cache is stale.
-- **stale** — file is missing from disk."""
+- **strong** — file on disk matches the indexed hash.
+- **rebuilt** — file matches disk and was re-indexed in the most recent refresh.
+- **weak** — file exists but changed since indexing; re-read it before quoting.
+- **stale** — file is missing from disk.
+
+When `retrieval` is "keyword-only", `warning` says why (embeddings unavailable, or the
+index was built with another model): only files sharing a word with the query come back,
+so rephrase with the document's own wording if nothing fits."""
 
 
 def build_server(config_path: Optional[str] = None) -> FastMCP:

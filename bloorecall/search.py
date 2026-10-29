@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import threading
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +14,8 @@ import numpy as np
 from . import store
 from .config import FUSION_MODES, active_policy, index_path
 from .embeddings import EmbeddingUnavailable, OllamaEmbedder
-from .trust import TrustVerdict, verify_path
-from .util import tokens, utc_iso
+from .trust import verify_path
+from .util import TOKENIZER_VERSION, tokens, utc_iso, words
 
 # Only owner-local corpus material is searchable. The column is kept so a future
 # permission tier cannot silently become visible.
@@ -59,8 +61,6 @@ class BlooRecallIndex:
         try:
             self.metadata = store.read_metadata(connection)
             rows = store.load_search_rows(connection, ALLOWED_PERMISSIONS)
-            model = self.metadata.get("embedding_model", "")
-            self._cached_text_hashes: set[str] = store.cached_text_hashes(connection, model)
         finally:
             connection.close()
         self.fingerprint = _fingerprint(path)
@@ -69,25 +69,28 @@ class BlooRecallIndex:
         self.ordinals = [int(row[2]) for row in rows]
         self.content_hashes = [row[3] for row in rows]
         self.texts = [row[4] for row in rows]
-        self.token_counts = np.array([float(row[5]) for row in rows], dtype=np.float32)
         self.mtimes = np.array([float(row[8]) for row in rows], dtype=np.float64)
         self.projects = [row[9] for row in rows]
         self.file_types = [row[11] for row in rows]
-        self.text_hashes = [row[12] for row in rows]
         self.indexed_ats = [float(row[13]) for row in rows]
 
-        # Path-level lookups for trust verification: every chunk of a file shares
-        # the same content_hash / indexed_at, so we key on path.
-        self._path_text_hashes: dict[str, list[str]] = {}
-        for path_value, text_hash in zip(self.paths, self.text_hashes):
-            self._path_text_hashes.setdefault(path_value, []).append(text_hash)
+        # Term counts are stored per chunk at index time. An index written by an older tokenizer
+        # is re-tokenized from its chunk text here, so search is right before the next refresh
+        # (which rewrites the stored counts, without re-embedding anything).
+        if self.metadata.get("tokenizer_version") == TOKENIZER_VERSION:
+            term_counts = [json.loads(row[6]) for row in rows]
+        else:
+            term_counts = [Counter(tokens(text)) for text in self.texts]
+        self.token_counts = np.array(
+            [float(sum(counts.values())) for counts in term_counts], dtype=np.float32
+        )
 
         self.count = len(rows)
         # Postings are held as numpy pairs: a Python list of tuples for a corpus this
         # size costs hundreds of megabytes, two arrays per term costs tens.
         raw_postings: dict[str, tuple[list[int], list[float]]] = {}
-        for index, row in enumerate(rows):
-            for term, frequency in json.loads(row[6]).items():
+        for index, counts in enumerate(term_counts):
+            for term, frequency in counts.items():
                 entry = raw_postings.get(term)
                 if entry is None:
                     entry = ([], [])
@@ -98,7 +101,7 @@ class BlooRecallIndex:
             term: (np.array(indices, dtype=np.int64), np.array(frequencies, dtype=np.float32))
             for term, (indices, frequencies) in raw_postings.items()
         }
-        del raw_postings
+        del raw_postings, term_counts
         self.average_length = float(self.token_counts.mean()) if self.count else 1.0
 
         dimension = int(self.metadata.get("embedding_dimension", 0) or 0)
@@ -117,10 +120,7 @@ class BlooRecallIndex:
         self.matrix = matrix
 
         # Path metadata is identical for every chunk of a file; score it once per path.
-        self.path_terms: dict[str, set[str]] = {}
-        for path_value, project in zip(self.paths, self.projects):
-            if path_value not in self.path_terms:
-                self.path_terms[path_value] = set(tokens(f"{path_value} {project}"))
+        self.path_terms = _path_terms(self.paths, self.projects, [row[14] for row in rows])
         self.path_index = np.array(_path_indices(self.paths), dtype=np.int32)
         self.unique_paths = _unique_paths(self.paths)
         self.min_mtime = float(self.mtimes.min()) if self.count else 0.0
@@ -140,8 +140,6 @@ class BlooRecallIndex:
                 indexed_hash=row["content_hash"],
                 indexed_at=row["indexed_at"],
                 refreshed_at=refreshed_at,
-                cached_text_hashes=self._cached_text_hashes,
-                path_text_hashes=self._path_text_hashes.get(row["path"], []),
             )
             row["trust"] = {
                 "verdict": check.verdict.value,
@@ -149,7 +147,6 @@ class BlooRecallIndex:
                 "file_exists": check.file_exists,
                 "hash_match": check.on_disk_hash is not None
                 and check.on_disk_hash == check.indexed_hash,
-                "embedding_fresh": check.embedding_fresh,
             }
         return results
 
@@ -207,9 +204,10 @@ class BlooRecallIndex:
                     + (1.0 - dense_weight) * bm25_normalized
                 )
 
+        query_words = set(words(question))
         overlap_by_path = np.array(
             [
-                len(query_set & self.path_terms[path_value]) / max(1, len(query_set))
+                len(query_words & self.path_terms[path_value]) / max(1, len(query_words))
                 for path_value in self.unique_paths
             ],
             dtype=np.float32,
@@ -225,6 +223,11 @@ class BlooRecallIndex:
             + float(policy["metadata_weight"]) * metadata_overlap
         )
         coverage = matched_terms / max(1, len(query_set))
+        if query_vector is None:
+            # Keyword-only search must not pad its list with files that match nothing (ranked by
+            # recency alone): a hit needs a query term in its text or in its path.
+            matched = (lexical > 0) | (metadata_overlap > 0)
+            scores = np.where(matched, scores, -np.inf).astype(np.float32)
         if project:
             needle = project.casefold()
             allowed = np.array([needle in label.casefold() for label in self.projects], dtype=bool)
@@ -308,6 +311,24 @@ def _rrf(similarity: np.ndarray, lexical: np.ndarray, dense_weight: float, k: in
     return (fused / (float(fused.max()) or 1.0)).astype(np.float32)
 
 
+def _path_terms(paths: list[str], projects: list[str], root_labels: list[str]) -> dict[str, set[str]]:
+    """Words naming where each file sits: its project label, its folders and its file stem.
+
+    The folders above a corpus root (/home/<user>/notes) are shared by every file in it, so they
+    carry no signal; cut them by taking the deepest folder all of that root's files share.
+    """
+    folders_by_root: dict[str, set[str]] = {}
+    for path_value, root_label in zip(paths, root_labels):
+        folders_by_root.setdefault(root_label, set()).add(os.path.dirname(path_value))
+    base_by_root = {label: os.path.commonpath(folders) for label, folders in folders_by_root.items()}
+    terms: dict[str, set[str]] = {}
+    for path_value, project, root_label in zip(paths, projects, root_labels):
+        if path_value not in terms:
+            below = os.path.relpath(path_value, base_by_root[root_label])
+            terms[path_value] = set(words(f"{project} {os.path.splitext(below)[0]}"))
+    return terms
+
+
 def _path_indices(paths: list[str]) -> list[int]:
     lookup: dict[str, int] = {}
     result: list[int] = []
@@ -370,6 +391,32 @@ class SearchEngine:
                 self._index = BlooRecallIndex(self.index_path)
             return self._index
 
+    def _query_vector(
+        self, index: BlooRecallIndex, question: str
+    ) -> tuple[list[float] | None, str | None]:
+        """Embed the query, or say why this search has to rank by keyword alone.
+
+        Ollama down or the model missing must not take search down with it, and a vector from a
+        model other than the index's would rank chunks by noise (or not fit the matrix at all),
+        so each falls back to the keyword index with a warning instead of failing the query.
+        """
+        indexed_model = index.metadata.get("embedding_model", "")
+        if indexed_model and indexed_model != self.embedder.model:
+            return None, (
+                f"index was built with '{indexed_model}' but config asks for "
+                f"'{self.embedder.model}'; run 'bloorecall refresh --full' to re-embed"
+            )
+        try:
+            vector = self.embedder.embed_one(question)
+        except EmbeddingUnavailable as error:
+            return None, str(error)
+        if index.count and len(vector) != index.dimension:
+            return None, (
+                f"the query embedding has {len(vector)} dimensions but the index holds "
+                f"{index.dimension}; run 'bloorecall refresh --full' to re-embed"
+            )
+        return vector, None
+
     def search(
         self,
         query: str,
@@ -392,15 +439,8 @@ class SearchEngine:
         policy["top_k"] = limit
 
         index = self.index
-        # Ollama down or the model missing must not take search down with it: keep answering
-        # from the keyword index and say so, instead of failing the whole query.
-        retrieval = "hybrid"
-        warning: str | None = None
-        vector: list[float] | None
-        try:
-            vector = self.embedder.embed_one(question)
-        except EmbeddingUnavailable as error:
-            vector, retrieval, warning = None, "keyword-only", str(error)
+        vector, warning = self._query_vector(index, question)
+        retrieval = "keyword-only" if vector is None else "hybrid"
         results = index.rank(question, vector, policy, project=project)[:limit]
 
         snippet_chars = int(defaults.get("snippet_chars", 240))

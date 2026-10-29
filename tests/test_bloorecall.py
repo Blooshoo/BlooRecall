@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -16,10 +20,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from bloorecall import store  # noqa: E402
 from bloorecall.config import active_policy, index_path, load_config, manifest_path  # noqa: E402
 from bloorecall.corpus import chunk_markdown, chunk_text, secret_reason, walk_corpus  # noqa: E402
-from bloorecall.embeddings import EmbeddingUnavailable  # noqa: E402
+from bloorecall.embeddings import EmbeddingUnavailable, OllamaEmbedder  # noqa: E402
 from bloorecall.indexer import refresh  # noqa: E402
 from bloorecall.search import PrivateQueryRefused, SearchEngine, _dense_scale, _rrf, snippet_for  # noqa: E402
-from bloorecall.util import PROJECT_ROOT, ensure_write_target, tokens  # noqa: E402
+from bloorecall.util import PROJECT_ROOT, TOKENIZER_VERSION, ensure_write_target, tokens  # noqa: E402
 
 
 class FakeEmbedder:
@@ -194,6 +198,18 @@ class TestChunker(CorpusHarness):
         self.assertEqual(chunk_markdown(body, 400, 60), chunk_text(body, 400, 60))
 
 
+class TestTokenizer(unittest.TestCase):
+    def test_a_sentence_ending_word_is_the_same_token(self) -> None:
+        self.assertEqual(tokens("Uses backoff. Status: done."), ["uses", "backoff", "status", "done"])
+
+    def test_identifiers_stay_whole(self) -> None:
+        text = "set retry_policy.max_attempts in docs/setup.md (v1.2.3), see ERR_QUOTA_429."
+        self.assertEqual(
+            tokens(text),
+            ["set", "retry_policy.max_attempts", "in", "docs/setup.md", "v1.2.3", "see", "err_quota_429"],
+        )
+
+
 class TestRefresh(CorpusHarness):
     def test_first_run_indexes_everything(self) -> None:
         summary = self.refresh()
@@ -261,6 +277,68 @@ class TestRefresh(CorpusHarness):
         first = self.refresh()
         second = self.refresh(full=True)
         self.assertEqual(first["manifest_sha256"], second["manifest_sha256"])
+
+    def test_editing_a_long_untouched_file_reembeds_only_the_changed_chunk(self) -> None:
+        long_doc = write(
+            self.corpus / "docs" / "long.md",
+            "# Long\n\n" + "\n\n".join(f"Paragraph {n}. " + "filler words " * 25 for n in range(6)),
+        )
+        first = self.refresh()
+        self.assertGreater(first["chunk_count"], 6)
+        # Three weeks without edits: every cache entry expires (vector_cache_days is 14).
+        connection = sqlite3.connect(index_path(self.config))
+        connection.execute("UPDATE vectors SET last_used = last_used - 21 * 86400")
+        connection.commit()
+        connection.close()
+        self.assertGreater(self.refresh()["vectors_pruned"], 0)
+        long_doc.write_text(long_doc.read_text().replace("Paragraph 3.", "Paragraph three."))
+        summary = self.refresh()
+        self.assertEqual(summary["reindexed"], 1)
+        self.assertEqual(summary["chunks_embedded"], 1)
+
+    def test_an_index_from_the_old_tokenizer_is_retokenized_without_reembedding(self) -> None:
+        self.refresh()
+        # Rewind the index to v1.1: trailing punctuation kept in stored terms, no version stamp.
+        connection = sqlite3.connect(index_path(self.config))
+        for chunk_id, text in connection.execute("SELECT chunk_id, text FROM chunks").fetchall():
+            old = {}
+            for token in __import__("re").findall(r"[a-z0-9][a-z0-9_./:-]*", text.casefold()):
+                old[token] = old.get(token, 0) + 1
+            connection.execute(
+                "UPDATE chunks SET term_counts_json = ?, token_count = ? WHERE chunk_id = ?",
+                (json.dumps(old), sum(old.values()), chunk_id),
+            )
+        connection.execute("DELETE FROM metadata WHERE key = 'tokenizer_version'")
+        connection.commit()
+        connection.close()
+
+        # "jitter" only ever ends a sentence in the corpus, so v1.1 stored it as "jitter.".
+        down = SearchEngine(self.config, embedder=DownEmbedder())
+        paths = [row["path"] for row in down.search("jitter")["results"]]
+        self.assertTrue(paths and paths[0].endswith("websocket-retry.md"))
+
+        summary = self.refresh()
+        self.assertEqual(summary["retokenized"], summary["chunk_count"])
+        self.assertEqual(summary["chunks_embedded"], 0)
+        connection = store.connect_read(index_path(self.config))
+        try:
+            self.assertEqual(store.read_metadata(connection)["tokenizer_version"], TOKENIZER_VERSION)
+            stored = " ".join(row[0] for row in connection.execute("SELECT term_counts_json FROM chunks"))
+        finally:
+            connection.close()
+        self.assertIn('"jitter"', stored)
+        self.assertNotIn('"jitter."', stored)
+
+    def test_a_root_dropped_from_the_config_takes_its_files_with_it(self) -> None:
+        other = Path(tempfile.mkdtemp(prefix="bloorecall-other-"))
+        self.addCleanup(shutil.rmtree, other, True)
+        write(other / "kitchen.md", "# Kitchen\n\nThe oven runs hot.\n")
+        self.config["corpus_roots"].append({"path": str(other), "label": "other"})
+        self.assertEqual(self.refresh()["source_count"], 4)
+        self.config["corpus_roots"].pop()
+        summary = self.refresh()
+        self.assertEqual(summary["removed"], 1)
+        self.assertEqual(summary["source_count"], 3)
 
 
 class TestSearch(CorpusHarness):
@@ -371,11 +449,67 @@ class TestSearch(CorpusHarness):
         self.assertEqual(payload["policy"], "hybrid-rrf-v1")
         self.assertTrue(payload["results"][0]["path"].endswith("websocket-retry.md"))
 
+    def test_path_terms_are_words_below_the_corpus_root(self) -> None:
+        self.refresh()
+        index = self.engine().index
+        websocket = next(path for path in index.path_terms if path.endswith("websocket-retry.md"))
+        # Project label and folders/stem under the root; nothing from the temp dir above it.
+        self.assertEqual(index.path_terms[websocket], {"testcorpus", "docs", "websocket", "retry"})
+
+    def test_a_folder_named_in_the_query_breaks_a_tie(self) -> None:
+        for folder in ("gateway", "kitchen"):
+            note = write(self.corpus / folder / "notes.md", "# Notes\n\nThe retry budget is five attempts.\n")
+            os.utime(note, (1_760_000_000, 1_760_000_000))
+        self.refresh()
+        top = self.engine().search("kitchen retry budget", top_k=2)["results"][0]
+        self.assertTrue(top["path"].endswith("kitchen/notes.md"))
+
+    def test_keyword_only_search_does_not_pad_with_unmatched_files(self) -> None:
+        self.refresh()
+        payload = SearchEngine(self.config, embedder=DownEmbedder()).search("xylophone quartet")
+        self.assertEqual(payload["retrieval"], "keyword-only")
+        self.assertEqual(payload["results"], [])
+
+    def test_an_index_from_another_model_falls_back_to_keyword_only(self) -> None:
+        self.refresh()
+
+        class OtherModel(FakeEmbedder):
+            model = "other-embed:test"
+
+        payload = SearchEngine(self.config, embedder=OtherModel()).search("websocket backoff")
+        self.assertEqual(payload["retrieval"], "keyword-only")
+        self.assertIn("refresh --full", payload["warning"])
+        self.assertTrue(payload["results"][0]["path"].endswith("websocket-retry.md"))
+
+    def test_a_query_vector_of_the_wrong_size_falls_back_to_keyword_only(self) -> None:
+        self.refresh()
+
+        class Resized(FakeEmbedder):
+            dimension = 32
+
+        payload = SearchEngine(self.config, embedder=Resized()).search("websocket backoff")
+        self.assertEqual(payload["retrieval"], "keyword-only")
+        self.assertIn("dimensions", payload["warning"])
+
     def test_snippet_windows_around_the_match(self) -> None:
         text = "alpha " * 100 + "the websocket retry budget is five " + "omega " * 100
         snippet = snippet_for(text, "websocket retry budget", 80)
         self.assertIn("websocket", snippet)
         self.assertLessEqual(len(snippet), 82)
+
+
+class TestEmbedder(unittest.TestCase):
+    def test_ollama_error_text_is_passed_on(self) -> None:
+        body = io.BytesIO(b'{"error":"model \\"nomic\\" not found, try pulling it first"}')
+        refusal = urllib.error.HTTPError("http://x/api/embed", 404, "Not Found", {}, body)
+        with mock.patch("urllib.request.urlopen", side_effect=refusal):
+            with self.assertRaisesRegex(EmbeddingUnavailable, "HTTP 404: model .nomic. not found"):
+                OllamaEmbedder("nomic").embed_one("hello")
+
+    def test_a_dropped_connection_is_embedding_unavailable(self) -> None:
+        with mock.patch("urllib.request.urlopen", side_effect=ConnectionResetError("reset by peer")):
+            with self.assertRaises(EmbeddingUnavailable):
+                OllamaEmbedder("nomic").embed_one("hello")
 
 
 class TestFusion(unittest.TestCase):

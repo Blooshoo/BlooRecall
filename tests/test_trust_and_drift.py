@@ -6,18 +6,23 @@ SQLite index built with a fake embedder, no network.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from bloorecall import store  # noqa: E402
 from bloorecall.config import index_path, load_config, manifest_path  # noqa: E402
 from bloorecall.corpus import walk_corpus  # noqa: E402
+from bloorecall.embeddings import OllamaEmbedder  # noqa: E402
 from bloorecall.trust import TrustVerdict, verify_path  # noqa: E402
 from bloorecall.verify_drift import EXIT_CLEAN, EXIT_DRIFT, EXIT_ERROR, run_drift_audit  # noqa: E402
 from bloorecall.util import sha256_file, sha256_bytes, PROJECT_ROOT  # noqa: E402
@@ -47,8 +52,6 @@ class TestTrustVerdictEnum(unittest.TestCase):
             indexed_hash="abc",
             indexed_at=100.0,
             refreshed_at=100.0,
-            cached_text_hashes=set(),
-            path_text_hashes=["abc"],
         )
         self.assertEqual(result.verdict, TrustVerdict.STALE)
         self.assertFalse(result.file_exists)
@@ -59,18 +62,14 @@ class TestTrustVerdictEnum(unittest.TestCase):
         content = b"hello world"
         path.write_bytes(content)
         content_hash = sha256_bytes(content)
-        text_hash = sha256_bytes(b"hello")
         result = verify_path(
             path=str(path),
             indexed_hash=content_hash,
             indexed_at=50.0,
             refreshed_at=200.0,
-            cached_text_hashes={text_hash},
-            path_text_hashes=[text_hash],
         )
         self.assertEqual(result.verdict, TrustVerdict.STRONG)
         self.assertTrue(result.file_exists)
-        self.assertTrue(result.embedding_fresh)
         self.assertFalse(result.just_rebuilt)
 
     def test_rebuilt_when_indexed_at_matches_refresh(self) -> None:
@@ -78,14 +77,11 @@ class TestTrustVerdictEnum(unittest.TestCase):
         content = b"fresh content"
         path.write_bytes(content)
         content_hash = sha256_bytes(content)
-        text_hash = sha256_bytes(b"fresh")
         result = verify_path(
             path=str(path),
             indexed_hash=content_hash,
             indexed_at=1000.0,
             refreshed_at=1000.0,
-            cached_text_hashes={text_hash},
-            path_text_hashes=[text_hash],
         )
         self.assertEqual(result.verdict, TrustVerdict.REBUILT)
         self.assertTrue(result.just_rebuilt)
@@ -94,33 +90,14 @@ class TestTrustVerdictEnum(unittest.TestCase):
         path = self.tmp / "drifted.md"
         content = b"original"
         path.write_bytes(content)
-        text_hash = sha256_bytes(b"original")
         result = verify_path(
             path=str(path),
             indexed_hash="deadbeef" + "0" * 54,
             indexed_at=50.0,
             refreshed_at=200.0,
-            cached_text_hashes={text_hash},
-            path_text_hashes=[text_hash],
         )
         self.assertEqual(result.verdict, TrustVerdict.WEAK)
         self.assertIn("content hash mismatch", result.reason)
-
-    def test_weak_on_stale_embedding(self) -> None:
-        path = self.tmp / "stale-emb.md"
-        content = b"some content"
-        path.write_bytes(content)
-        content_hash = sha256_bytes(content)
-        result = verify_path(
-            path=str(path),
-            indexed_hash=content_hash,
-            indexed_at=50.0,
-            refreshed_at=200.0,
-            cached_text_hashes=set(),  # vector was pruned
-            path_text_hashes=[sha256_bytes(b"some")],
-        )
-        self.assertEqual(result.verdict, TrustVerdict.WEAK)
-        self.assertIn("stale embedding", result.reason)
 
 
 class TestSearchTrustVerdict(CorpusHarness):
@@ -166,6 +143,19 @@ class TestSearchTrustVerdict(CorpusHarness):
         self.assertEqual(weak_hit["trust"]["verdict"], "weak")
         self.assertIn("content hash mismatch", weak_hit["trust"].get("reason", "") + "")
 
+    def test_verdict_stays_strong_once_the_vector_cache_expires(self) -> None:
+        # v1.1 read an expired cache entry as drift, so every file left unedited for
+        # vector_cache_days (14) came back "weak" even though nothing had changed.
+        self.refresh()
+        connection = sqlite3.connect(index_path(self.config))
+        connection.execute("UPDATE vectors SET last_used = last_used - 15 * 86400")
+        connection.commit()
+        connection.close()
+        summary = self.refresh()
+        self.assertGreater(summary["vectors_pruned"], 0)
+        payload = self.engine().search("websocket reconnect backoff", top_k=3)
+        self.assertIn(payload["results"][0]["trust"]["verdict"], {"strong", "rebuilt"})
+
 
 class TestDriftAudit(CorpusHarness):
     """End-to-end: the drift audit script detects and reports drift."""
@@ -207,10 +197,41 @@ class TestDriftAudit(CorpusHarness):
     def test_shallow_mode_misses_silent_rewrite(self) -> None:
         self.refresh()
         target = self.corpus / "docs" / "websocket-retry.md"
-        target.write_bytes(b"silent rewrite, same mtime size not updated\n")
-        # Shallow mode only stats — no hash comparison, so no drift
-        code = run_drift_audit(self.config, deep=False, as_json=False)
-        self.assertEqual(code, EXIT_CLEAN)
+        before = target.stat()
+        original = target.read_bytes()
+        # Same size, mtime put back: only a re-hash can tell, and shallow mode only stats.
+        target.write_bytes(original.replace(b"jitter", b"JITTER"))
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(run_drift_audit(self.config, deep=False, as_json=False), EXIT_CLEAN)
+        self.assertEqual(run_drift_audit(self.config, deep=True, as_json=False), EXIT_DRIFT)
+
+    def test_shallow_mode_catches_an_ordinary_edit(self) -> None:
+        self.refresh()
+        write(self.corpus / "docs" / "websocket-retry.md", "# WebSocket retry\n\nNow a fixed delay.\n")
+        self.assertEqual(run_drift_audit(self.config, deep=False, as_json=False), EXIT_DRIFT)
+
+    def test_files_refresh_refuses_are_not_unindexed_drift(self) -> None:
+        write(self.corpus / "docs" / "aws.md", "# Keys\n\nAKIA1234567890ABCDEF is live\n")
+        write(self.corpus / "docs" / "blank.md", "\n   \n")
+        summary = self.refresh()
+        self.assertEqual(summary["secret_blocked"], 1)
+        self.assertEqual(run_drift_audit(self.config, deep=True, as_json=False), EXIT_CLEAN)
+
+    def test_doctor_verify_drift_runs_the_audit(self) -> None:
+        from bloorecall.cli import main
+
+        self.refresh()
+        config_file = self.index_dir / "config.json"
+        config_file.write_text(json.dumps(self.config), encoding="utf-8")
+        (self.corpus / "notes" / "grocery.txt").unlink()
+
+        def doctor(*flags: str) -> int:
+            with mock.patch.object(OllamaEmbedder, "embed_one", FakeEmbedder().embed_one):
+                with redirect_stdout(io.StringIO()):
+                    return main(["--config", str(config_file), "doctor", *flags])
+
+        self.assertEqual(doctor(), 0)
+        self.assertEqual(doctor("--verify-drift"), 1)
 
     def test_missing_index_exits_error(self) -> None:
         # Point at a non-existent index

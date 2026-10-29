@@ -9,12 +9,24 @@ from typing import Any, Iterable, Iterator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_./:-]*", re.IGNORECASE)
+# Identifiers stay whole (retry_policy.max_attempts, ERR_QUOTA_429, docs/setup.md) but a token
+# ends on a letter or digit, so a sentence's last word is the same token as anywhere else
+# ("backoff." used to be its own term, which no query could match).
+TOKEN_RE = re.compile(r"[a-z0-9](?:[a-z0-9_./:-]*[a-z0-9])?", re.IGNORECASE)
+# Bump whenever tokens() changes: an index stamped with another version is re-tokenized from
+# its stored chunk text (in memory when search loads it, on disk by the next refresh).
+TOKENIZER_VERSION = "2"
+WORD_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 
 
 def tokens(text: str) -> list[str]:
-    """Tokenizer shared with the v0 lab; changing it invalidates index comparability."""
+    """Index- and query-time tokenizer; changing it means bumping TOKENIZER_VERSION."""
     return [token.casefold() for token in TOKEN_RE.findall(text)]
+
+
+def words(text: str) -> list[str]:
+    """Bare alphanumeric runs: "notes/reconnect-design.md" -> notes, reconnect, design, md."""
+    return [word.casefold() for word in WORD_RE.findall(text)]
 
 
 def sha256_bytes(data: bytes) -> str:
