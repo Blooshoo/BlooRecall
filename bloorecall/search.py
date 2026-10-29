@@ -33,6 +33,19 @@ PRIVATE_QUERY_MARKERS = {
     "personal memory",
 }
 
+# Function words are dropped from the query before BM25 (the index keeps every term). BM25's IDF
+# makes them light, but rank fusion only sees ranks: a chunk sharing nothing but "the" with the
+# query still earns a keyword rank, a short chunk a high one, so on short notes these words
+# decided the order (v1.1). Same list as the frozen grep baseline's; a query of nothing but
+# function words keeps them all.
+STOPWORDS = frozenset(
+    """a about after all also an and any are as at be because been before being both but by came can
+could did do does done for from get gets got had has have he her here hers him his how i if in into is
+it its just like made make many may me might more most much must my never no nor not now of off on one
+only or other our out over own said same see she should since so some such than that the their them
+then there these they this those through to too under until up use used using very was way we well
+were what when where which while who why will with within without would you your""".split()
+)
 BM25_K1 = 1.5
 BM25_B = 0.75
 COVERAGE_BONUS = 0.18
@@ -42,6 +55,12 @@ WHITESPACE_RE = re.compile(r"\s+")
 
 class PrivateQueryRefused(RuntimeError):
     """Raised when a query asks for material BlooRecall will not surface."""
+
+
+def keyword_terms(question: str) -> list[str]:
+    """The query's BM25 terms: its tokens minus function words (all of them if that is all)."""
+    terms = tokens(question)
+    return [term for term in terms if term not in STOPWORDS] or terms
 
 
 def private_query_reason(question: str) -> str | None:
@@ -191,7 +210,7 @@ class BlooRecallIndex:
         """
         if not self.count:
             return []
-        query_terms = tokens(question)
+        query_terms = keyword_terms(question)
         query_set = set(query_terms)
         lexical, matched_terms = self._bm25(query_terms)
         maximum = float(lexical.max()) if self.count else 0.0
@@ -297,10 +316,10 @@ def _dense_scale(similarity: np.ndarray, fusion: str) -> np.ndarray:
     raise ValueError(f"unknown fusion mode '{fusion}'; expected one of {', '.join(FUSION_MODES)}")
 
 
-def _reciprocal_ranks(values: np.ndarray, k: int) -> np.ndarray:
+def _ranks(values: np.ndarray) -> np.ndarray:
     ranks = np.empty(values.size, dtype=np.float32)
     ranks[np.argsort(-values, kind="stable")] = np.arange(1, values.size + 1, dtype=np.float32)
-    return 1.0 / (k + ranks)
+    return ranks
 
 
 def _rrf(similarity: np.ndarray, lexical: np.ndarray, dense_weight: float, k: int) -> np.ndarray:
@@ -312,9 +331,16 @@ def _rrf(similarity: np.ndarray, lexical: np.ndarray, dense_weight: float, k: in
     the weight means the same thing for any model or corpus size (minmax rescaling fixes the
     scale too, but anchors to the query's least similar chunk, so its effective weight drifts as the
     corpus grows).
+
+    Both orders rank every chunk: one with no keyword match shares the rank after the last match
+    instead of getting nothing from BM25. No keyword evidence then counts as the weakest evidence
+    rather than as worse than any, which (v1.1) buried a right note that shares no word with the
+    query under every chunk that shares one.
     """
-    fused = dense_weight * _reciprocal_ranks(similarity, k)
-    fused += (1.0 - dense_weight) * np.where(lexical > 0, _reciprocal_ranks(lexical, k), 0.0)
+    matched = lexical > 0
+    keyword_ranks = np.where(matched, _ranks(lexical), np.count_nonzero(matched) + 1)
+    fused = dense_weight / (k + _ranks(similarity))
+    fused += (1.0 - dense_weight) / (k + keyword_ranks)
     return (fused / (float(fused.max()) or 1.0)).astype(np.float32)
 
 

@@ -107,13 +107,20 @@ embeddings-only on meaning-style queries and keeps keyword search's edge on exac
 The fusion was picked on the dev split (`python3 -m bench.sweep`) and confirmed once on test;
 the report has the diagnosis.
 
-v1.2 fixes two ranking bugs rather than tuning anything: the tokenizer kept a sentence's full
-stop (`backoff.` never matched `backoff`; 7% of the corpus's tokens), and whole paths were one
-token, so the path-match bonus almost never fired. On this benchmark both are within noise. They
-were measured on the same harness with a stand-in embedder (all-MiniLM-L6-v2: the work was done
-without Ollama), where test MRR@10 for the shipped policy moved +0.011 (95% CI [-0.023, +0.046]),
-Recall@5 not at all, and the grep baseline stayed byte-identical. The qwen3 numbers here and in
-the report are v1.1's; `python3 -m bench.run --system all --split test --fresh` then
+v1.2 fixes ranking bugs rather than retuning weights. The tokenizer kept a sentence's full stop
+(`backoff.` never matched `backoff`; 7% of the corpus's tokens), and whole paths were one token,
+so the path-match bonus almost never fired. Fusion also counted function words ("the", "a") as
+keyword evidence, and gave a chunk with no keyword match nothing from BM25, ranking it below
+every chunk that shared a word with the query. Short texts show it worst: on a
+[probe of 40 haiku](bench/haiku/README.md) with queries that share no content word with their
+poem, v1.1's fusion scored MRR@10 0.29 where embeddings alone scored 0.85. v1.2 drops function
+words from the BM25 query and ranks unmatched chunks just after the last match: 0.69.
+
+Measured on the same harness with a stand-in embedder (all-MiniLM-L6-v2; the work was done
+without Ollama), v1.2 against v1.1 on the test split: shipped-policy Recall@5 0.936 → 0.984
+(3 queries gained, none lost), MRR@10 flat (−0.010, 95% CI [−0.057, +0.040]), keyword-only
+nDCG@10 +0.041 (CI [+0.001, +0.084]); the grep baseline is byte-identical. The qwen3 numbers here
+and in the report are v1.1's; `python3 -m bench.run --system all --split test --fresh` then
 `python3 -m bench.report` brings them up to date.
 
 ![Recall@5 by system](docs/benchmark.svg)
@@ -137,6 +144,8 @@ always means one behavior. To get v1.1's ranking, copy the `hybrid-rrf-v1` block
 **Upgrading to v1.2:** nothing to run. Search re-tokenizes an older index in memory, and the
 next `bloorecall refresh` rewrites it on disk without re-embedding (its summary counts
 `retokenized` chunks). Behavior changes:
+- Ranking: the fixes in [Benchmark](#benchmark) apply to every policy, so `hybrid-rrf-v1` and
+  `baseline-v0` rank a little differently than they did in v1.1.
 - Results no longer carry `trust.embedding_fresh`. It read the embedding cache, whose entries
   expire after `vector_cache_days`, so every file left unedited for two weeks came back
   `weak`/`[DRIFT]`. Verdicts now depend on the file alone.

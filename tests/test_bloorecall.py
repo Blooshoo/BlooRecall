@@ -22,7 +22,14 @@ from bloorecall.config import active_policy, index_path, load_config, manifest_p
 from bloorecall.corpus import chunk_markdown, chunk_text, secret_reason, walk_corpus  # noqa: E402
 from bloorecall.embeddings import EmbeddingUnavailable, OllamaEmbedder  # noqa: E402
 from bloorecall.indexer import refresh  # noqa: E402
-from bloorecall.search import PrivateQueryRefused, SearchEngine, _dense_scale, _rrf, snippet_for  # noqa: E402
+from bloorecall.search import (  # noqa: E402
+    PrivateQueryRefused,
+    SearchEngine,
+    _dense_scale,
+    _rrf,
+    keyword_terms,
+    snippet_for,
+)
 from bloorecall.util import PROJECT_ROOT, TOKENIZER_VERSION, ensure_write_target, tokens  # noqa: E402
 
 
@@ -541,11 +548,21 @@ class TestFusion(unittest.TestCase):
         linear = 0.9 * (self.SIMILARITY + 1) / 2 + 0.1 * self.LEXICAL / self.LEXICAL.max()
         self.assertEqual(int(np.argmax(linear)), 1)
 
-    def test_best_chunk_scores_one_and_non_matches_get_no_keyword_credit(self) -> None:
+    def test_best_chunk_scores_one_and_non_matches_tie_on_keywords(self) -> None:
         fused = _rrf(np.array([0.9, 0.5, 0.1]), np.array([0.0, 0.0, 0.0]), 0.5, 60)
         self.assertAlmostEqual(float(fused.max()), 1.0, places=6)
         self.assertEqual([int(i) for i in np.argsort(-fused)], [0, 1, 2])
         self.assertTrue(np.isfinite(_rrf(np.zeros(3), np.zeros(3), 0.0, 60)).all())
+
+    def test_no_keyword_match_ranks_like_the_weakest_match_not_below_it(self) -> None:
+        # Chunk 0 is dense's clear pick but shares no word with the query; 1 and 2 share one weak
+        # word each. Scoring 0 from BM25 (v1.1) put chunk 0 last, behind both weak matches.
+        fused = _rrf(np.array([0.9, 0.2, 0.1]), np.array([0.0, 0.3, 0.2]), 0.5, 60)
+        self.assertEqual([int(i) for i in np.argsort(-fused, kind="stable")], [1, 0, 2])
+
+    def test_function_words_are_not_keyword_evidence(self) -> None:
+        self.assertEqual(keyword_terms("How do we retry a dropped socket?"), ["retry", "dropped", "socket"])
+        self.assertEqual(keyword_terms("what is it"), ["what", "is", "it"])
 
 
 class TestConfig(unittest.TestCase):
