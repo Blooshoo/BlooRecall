@@ -172,7 +172,7 @@ def _refresh(
         for root in walk.over_budget:
             say(
                 f"WARNING {root['label']} holds {root['files']} indexable files but max_files is "
-                f"{root['max_files']}: indexing the newest {root['max_files']}"
+                f"{root['max_files']}: applying configured selection policy"
             )
 
         known = store.load_sources(connection)

@@ -19,7 +19,9 @@
     {
       "path": "/home/you/projects",
       "label": "projects",
-      "max_files": 4000
+      "max_files": 4000,
+      "selection": "balanced",
+      "max_files_per_project": 200
     }
   ],
   "allowed_extensions": [
