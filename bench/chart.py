@@ -1,4 +1,4 @@
-"""Generate docs/benchmark.svg (+ per-category chart) from bench/results/*.test.json.
+"""Generate docs/benchmark.svg (+ per-category and separate local coverage charts) from bench/results/*.test.json.
 
 Run:  var/bench/chart-venv/bin/python bench/chart.py   (needs matplotlib)
 
@@ -102,7 +102,7 @@ def headline_chart(results: dict[str, dict]) -> None:
     ax.set_xticks(range(len(systems)), [LABELS[s] for s in systems])
     ax.set_ylabel(f"{metric} (test, 95% bootstrap CI)", color=TEXT)
     ax.set_ylim(0, 1.12)
-    ax.set_title("BlooRecall retrieval benchmark — Recall@5 by system", color=TEXT, fontsize=12)
+    ax.set_title("Historical synthetic benchmark — Recall@5 (test N=63)", color=TEXT, fontsize=12)
     style_axes(ax)
     # Labels sit above each whisker's cap so they never collide with the error bar.
     for bar, value, upper in zip(bars, values, uppers):
@@ -140,7 +140,7 @@ def category_chart(results: dict[str, dict]) -> None:
     ax.set_xticks([i + 0.4 for i in range(len(categories))], categories, fontsize=8)
     ax.set_ylabel(f"{metric} by category (test)", color=TEXT)
     ax.set_ylim(0, 1.04)
-    ax.set_title("MRR@10 per query category", color=TEXT, fontsize=12)
+    ax.set_title("Historical synthetic benchmark — MRR@10 by category", color=TEXT, fontsize=12)
     style_axes(ax)
     legend = ax.legend(fontsize=8, frameon=False, loc="upper center", bbox_to_anchor=(0.5, -0.09), ncol=5)
     for text in legend.get_texts():
@@ -150,10 +150,50 @@ def category_chart(results: dict[str, dict]) -> None:
     plt.close(fig)
 
 
+
+def coverage_chart() -> None:
+    """Anonymized private sample; never combine it with the synthetic benchmark."""
+    data = json.loads((PROJECT_ROOT / "bench" / "coverage-20261104.json").read_text())
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4.9), dpi=160)
+    fig.patch.set_alpha(0)
+    n = data["paired_known_source_n"]
+    panels = [
+        ("Designated source hits (paired N=23)",
+         ["Top 10", "Top 5"], [data["designated_top10"], data["designated_top5"]], n),
+        ("Represented project groups", ["Groups"], [data["represented_project_groups"]], 55),
+        ("Previously dominant worktree", ["Allocated files"], [data["dominant_worktree_files"]], 4500),
+    ]
+    for ax, (title, labels, rows, ymax) in zip(axes, panels):
+        style_axes(ax)
+        for offset, key, color in [(-0.18, "before", "#7f8ea3"), (0.18, "after", "#d9a441")]:
+            values = [row[key] for row in rows]
+            bars = ax.bar([i + offset for i in range(len(rows))], values, width=0.34,
+                          color=color, edgecolor=EDGE, linewidth=0.6, label=key.title())
+            for bar, value in zip(bars, values):
+                label = f"{value}/{n}" if len(rows) == 2 else str(value)
+                ax.text(bar.get_x() + bar.get_width()/2, value + ymax*0.025, label,
+                        ha="center", color=TEXT, fontsize=10)
+        ax.set_xticks(range(len(rows)), labels)
+        ax.set_ylim(0, ymax * 1.12)
+        ax.set_title(title, color=TEXT, fontsize=10)
+    legend = axes[1].legend(frameon=False, loc="upper center")
+    for item in legend.get_texts():
+        item.set_color(TEXT)
+    fig.suptitle("Local coverage repair — private sample, 2026-11-04", color=TEXT, fontsize=13)
+    fig.text(0.5, 0.06, "Holdout: 3/3 after; all 13 previously useful retained. Original audit N=22 is a different denominator.",
+             ha="center", color=TEXT, fontsize=9)
+    fig.text(0.5, 0.015, "Sample-specific coverage, not global accuracy or speedup. Not comparable to the historical synthetic benchmark.",
+             ha="center", color=TEXT, fontsize=9)
+    fig.tight_layout(rect=(0, 0.12, 1, 0.94))
+    fig.savefig(DOCS / "coverage-repair.svg", transparent=True, metadata={"Date": None})
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     results = load_results()
     if not results:
         sys.exit(f"no *.test.json results in {RESULTS}")
     headline_chart(results)
     category_chart(results)
+    coverage_chart()
     print(f"wrote {DOCS/'benchmark.svg'} and {DOCS/'benchmark-by-category.svg'}")

@@ -119,6 +119,15 @@ def _validate_corpus(data: dict[str, Any], path: Path) -> None:
         isinstance(root, dict) and root.get("path") for root in roots
     ):
         raise RuntimeError(f"corpus_roots in {path} must list at least one folder as {{\"path\": ...}}")
+    for root in roots:
+        if root.get("selection", "newest") not in ("newest", "balanced"):
+            raise RuntimeError(f"{path}: unknown corpus selection policy")
+        for key in ("max_files", "max_depth"):
+            if not isinstance(root.get(key, 0), int) or isinstance(root.get(key, 0), bool) or root.get(key, 0) < 0:
+                raise RuntimeError(f"{path}: {key} must be a nonnegative integer")
+        quota = root.get("max_files_per_project", 200)
+        if not isinstance(quota, int) or isinstance(quota, bool) or quota < 1:
+            raise RuntimeError(f"{path}: max_files_per_project must be positive")
     size, overlap = data["chunk_chars"], data["chunk_overlap_chars"]
     if not (isinstance(size, int) and isinstance(overlap, int) and 0 <= overlap < size):
         raise RuntimeError(

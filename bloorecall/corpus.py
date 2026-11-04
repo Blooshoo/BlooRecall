@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+from collections import defaultdict, deque
 import os
 import re
 from dataclasses import dataclass
@@ -74,6 +75,9 @@ class Exclusions:
             str(path).encode("utf-8")
         except UnicodeEncodeError:
             return "file name is not valid UTF-8"
+        # .openclaw is the existing workspace infrastructure ancestor, not a corpus subtree.
+        if any(part.startswith(".") and part != ".openclaw" for part in path.parts):
+            return "hidden path segment"
         denied = {part.casefold() for part in path.parts} & self.path_parts
         if denied:
             return f"denied path segment: {sorted(denied)[0]}"
@@ -83,7 +87,7 @@ class Exclusions:
         as_text = str(path)
         if any(fnmatch.fnmatch(as_text, pattern) for pattern in self.globs):
             return "denied glob"
-        if path.is_symlink():
+        if any(parent.is_symlink() for parent in (path, *path.parents)):
             return "symlink source"
         try:
             resolved = path.resolve()
@@ -101,6 +105,8 @@ def _walk_root(
     pruned: list[dict[str, str]] | None = None,
 ) -> Iterator[Path]:
     """max_depth 0 means unlimited; 1 means files directly under the root only."""
+    if root.is_symlink() or exclusions.directory_denied(root.name):
+        return
     if root.is_file():
         yield root
         return
@@ -112,7 +118,7 @@ def _walk_root(
         else:
             keep: list[str] = []
             for name in sorted(directories):
-                if exclusions.directory_denied(name):
+                if exclusions.directory_denied(name) or (current_path / name).is_symlink():
                     if pruned is not None and not name.startswith("."):
                         pruned.append(
                             {
@@ -140,6 +146,33 @@ def _project_label(path: Path, root: Path, root_label: str) -> str:
     return root_label
 
 
+def _balanced(sources: list[SourceFile], root: Path, limit: int, per_project: int) -> tuple[list[SourceFile], list[SourceFile]]:
+    """Round-robin first-level projects/worktrees; safe locators consume quotas too."""
+    groups: dict[str, list[SourceFile]] = defaultdict(list)
+    for source in sources:
+        groups[source.project].append(source)
+
+    def order(source: SourceFile) -> tuple:
+        rel = source.path.relative_to(root.resolve())
+        name = source.path.name.casefold()
+        locator = len(rel.parts) <= 2 and (name in {"readme.md", "agents.md", "state.md"}
+                    or "handoff" in name or "next-push" in name)
+        shallow_doc = len(rel.parts) <= 3 and len(rel.parts) > 1 and rel.parts[-2] in {"docs", "specs"}
+        return (not locator, not shallow_doc, -source.mtime, str(source.path))
+
+    queues = {key: deque(sorted(rows, key=order)[:per_project]) for key, rows in sorted(groups.items())}
+    selected: list[SourceFile] = []
+    while queues and (not limit or len(selected) < limit):
+        for key in list(queues):
+            if limit and len(selected) >= limit:
+                break
+            selected.append(queues[key].popleft())
+            if not queues[key]:
+                del queues[key]
+    kept = {item.path for item in selected}
+    return selected, [item for item in sources if item.path not in kept]
+
+
 def walk_corpus(config: dict[str, Any]) -> WalkResult:
     exclusions = Exclusions(config)
     sources: list[SourceFile] = []
@@ -159,6 +192,9 @@ def walk_corpus(config: dict[str, Any]) -> WalkResult:
         covered_roots.append(str(root.resolve()))
         accepted: list[SourceFile] = []
         for path in _walk_root(root, exclusions, int(entry.get("max_depth", 0) or 0), rejections):
+            relative_parts = path.relative_to(root).parts if root.is_dir() else (path.name,)
+            if any(part.startswith(".") for part in relative_parts):
+                continue
             reason = exclusions.reject_reason(path)
             if reason:
                 if reason != "extension not allowlisted":
@@ -178,7 +214,6 @@ def walk_corpus(config: dict[str, Any]) -> WalkResult:
             resolved = path.resolve()
             if resolved in seen:
                 continue
-            seen.add(resolved)
             accepted.append(
                 SourceFile(
                     path=resolved,
@@ -189,6 +224,12 @@ def walk_corpus(config: dict[str, Any]) -> WalkResult:
                 )
             )
         limit = int(entry.get("max_files", 0) or 0)
+        if entry.get("selection", "newest") == "balanced":
+            if limit and len(accepted) > limit:
+                over_budget.append({"root": str(root), "label": label, "files": len(accepted), "max_files": limit})
+            accepted, dropped = _balanced(accepted, root, limit, int(entry.get("max_files_per_project", 200)))
+            for item in dropped:
+                rejections.append({"path": str(item.path), "reason": "over balanced project/root budget"})
         if limit and len(accepted) > limit:
             # Keep the freshest files when a root exceeds its budget.
             over_budget.append({"root": str(root), "label": label, "files": len(accepted), "max_files": limit})
@@ -196,6 +237,7 @@ def walk_corpus(config: dict[str, Any]) -> WalkResult:
             for dropped in accepted[limit:]:
                 rejections.append({"path": str(dropped.path), "reason": "over root max_files budget"})
             accepted = accepted[:limit]
+        seen.update(item.path for item in accepted)
         sources.extend(accepted)
     sources.sort(key=lambda item: str(item.path))
     rejections.sort(key=lambda row: (row["reason"], row["path"]))

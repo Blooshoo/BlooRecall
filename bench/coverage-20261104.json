@@ -1,0 +1,29 @@
+{
+  "dataset": "private-local-known-source-paired-2026-11-04",
+  "paired_known_source_n": 23,
+  "designated_top10": {
+    "before": 9,
+    "after": 22
+  },
+  "designated_top5": {
+    "before": 9,
+    "after": 21
+  },
+  "fresh_holdout": {
+    "n": 3,
+    "after": 3
+  },
+  "previously_useful_retained": {
+    "n": 13,
+    "after": 13
+  },
+  "represented_project_groups": {
+    "before": 8,
+    "after": 48
+  },
+  "dominant_worktree_files": {
+    "before": 3899,
+    "after": 200
+  },
+  "original_audit_known_source_n": 22
+}

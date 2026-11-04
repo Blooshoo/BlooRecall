@@ -123,7 +123,19 @@ nDCG@10 +0.041 (CI [+0.001, +0.084]); the grep baseline is byte-identical. The q
 and in the report are v1.1's; `python3 -m bench.run --system all --split test --fresh` then
 `python3 -m bench.report` brings them up to date.
 
-![Recall@5 by system](docs/benchmark.svg)
+![Historical synthetic Recall@5 by system](docs/benchmark.svg)
+
+### Corpus coverage repair (2026-11-04)
+
+Opt-in balanced root allocation prevents one first-level worktree from exhausting
+a broad project root. Existing configs keep newest selection.
+[Configuration, anonymized evidence and limitations](docs/coverage-repair-20261104.md).
+
+![Separate private local paired coverage sample](docs/coverage-repair.svg)
+
+This local N=23 sample is **not comparable** to the historical synthetic benchmark
+above. It measures sample-specific designated-source coverage, not global accuracy
+or a new model/ranking result. No speedup is claimed.
 
 Synthetic corpus and queries, one 0.6B embedding model, 63 test queries: treat the gaps between
 systems as the signal, not the absolute numbers. Setup, per-category results, an independent
